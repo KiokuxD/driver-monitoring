@@ -416,7 +416,7 @@
                 ctx.stroke();
                 for (const id of ids) {
                     ctx.beginPath();
-                    ctx.arc(lm[id].x * w, lm[id].y * h, 2, 0, Math.PI * 2);
+                    ctx.arc(lm[id].x * w, lm[id].y * h, 1.5, 0, Math.PI * 2);
                     ctx.fill();
                 }
             }
@@ -445,10 +445,10 @@
             drawPoly(NOSE, '#aaaaaa', 1, false);
             drawPoly(JAW, '#666666', 1, false);
 
-            // Iris center dots
+            // Iris center dots (raw MediaPipe)
             ctx.fillStyle = '#00ff00';
-            ctx.beginPath(); ctx.arc(lm[468].x * w, lm[468].y * h, 3, 0, Math.PI * 2); ctx.fill();
-            ctx.beginPath(); ctx.arc(lm[473].x * w, lm[473].y * h, 3, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(lm[468].x * w, lm[468].y * h, 1.5, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(lm[473].x * w, lm[473].y * h, 1.5, 0, Math.PI * 2); ctx.fill();
 
             // 3D Axis from nose tip
             if (mat) {
@@ -484,10 +484,10 @@
             const [klx, kly] = kalmanL.getPosition();
             const [krx, kry] = kalmanR.getPosition();
 
-            // Draw smoothed iris positions
+            // Draw smoothed iris positions (small dots)
             ctx.fillStyle = '#ffff00';
-            ctx.beginPath(); ctx.arc(klx * w, kly * h, 4, 0, Math.PI * 2); ctx.fill();
-            ctx.beginPath(); ctx.arc(krx * w, kry * h, 4, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(klx * w, kly * h, 2, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(krx * w, kry * h, 2, 0, Math.PI * 2); ctx.fill();
 
             // ---- EAR (Eye Aspect Ratio) ----
             let ear = 0.3;
