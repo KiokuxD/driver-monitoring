@@ -158,12 +158,13 @@
         });
 
         // MediaPipe 478-point canonical landmark indices
-        // EAR: 6 key points per eye (2 horizontal + 4 vertical)
+        // EAR: 6 key points per eye (proven to work)
         const L_EYE = [33, 160, 158, 133, 153, 144];
         const R_EYE = [362, 385, 387, 263, 373, 380];
-        // Full eye contour for overlay drawing
-        const L_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133];
-        const R_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263];
+        // Eye contour for overlay: upper lid + lower lid + corners
+        // Left: outer(33) → upper(159,158) → inner(133) → lower(145,144) → outer
+        const L_EYE_CONTOUR = [33, 159, 158, 133, 145, 144];
+        const R_EYE_CONTOUR = [362, 386, 387, 263, 374, 373];
         const L_IRIS = [468, 469, 470, 471, 472];
         const R_IRIS = [473, 474, 475, 476, 477];
         const MOUTH = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
@@ -564,8 +565,16 @@
 
             // Debug: log eye landmark y-positions to verify contour shape
             if (frameIdx % 120 === 0) {
-                const eyePts = L_EYE_CONTOUR.map(i => ({id:i, x: lm[i].x.toFixed(3), y: lm[i].y.toFixed(3)}));
-                log(`EYE PTS: ${eyePts.map(p => `${p.id}(${p.x},${p.y})`).join(' ')}`);
+                const eyePts = L_EYE_CONTOUR.map(i => {
+                    const p = lm[i];
+                    return p ? `${i}(${p.x.toFixed(2)},${p.y.toFixed(2)})` : `${i}??`;
+                }).join(' ');
+                const rPts = R_EYE_CONTOUR.map(i => {
+                    const p = lm[i];
+                    return p ? `${i}(${p.x.toFixed(2)},${p.y.toFixed(2)})` : `${i}??`;
+                }).join(' ');
+                log(`EYE L: ${eyePts}`);
+                log(`EYE R: ${rPts}`);
             }
 
             if (gazeResult.direction !== 'center' && calibrated) {
