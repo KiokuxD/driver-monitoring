@@ -562,9 +562,10 @@
             const blinkRate = getBlinkRate();
             const perclos = updatePERCLOS(isClosed, now);
 
-            // Debug blink every 60 frames
-            if (frameIdx % 60 === 0) {
-                log(`BLINK: closed=${isClosed} eyesClosed=${eyesClosed} dur=${blinkDur} rate=${blinkRate} perclos=${(perclos*100).toFixed(1)}% blinks=${blinkTimestamps.length}`);
+            // Debug: log eye landmark y-positions to verify contour shape
+            if (frameIdx % 120 === 0) {
+                const eyePts = L_EYE_CONTOUR.map(i => ({id:i, x: lm[i].x.toFixed(3), y: lm[i].y.toFixed(3)}));
+                log(`EYE PTS: ${eyePts.map(p => `${p.id}(${p.x},${p.y})`).join(' ')}`);
             }
 
             if (gazeResult.direction !== 'center' && calibrated) {
