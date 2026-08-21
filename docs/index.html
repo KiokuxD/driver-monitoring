@@ -267,6 +267,7 @@
                     results = faceLandmarker.detectForVideo(video, now);
                 } catch (e) {
                     detecting = false;
+                    console.warn('Detection error:', e);
                     requestAnimationFrame(detect);
                     return;
                 }
@@ -279,6 +280,7 @@
                     calibrated = false;
                     eyesClosed = false;
                     updateUI({ face: false, ear: 0, mar: 0, gaze: '-', yaw: 0, pitch: 0, alerts: ['NO_FACE'] });
+                    detecting = false;
                     requestAnimationFrame(detect);
                     return;
                 }
