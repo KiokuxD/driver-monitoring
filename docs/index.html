@@ -108,7 +108,6 @@
         let frameIdx = 0;
         let baseYaw = 0, basePitch = 0, calibrated = false;
         let lastVideoTime = -1;
-        let lastDetectTime = 0;
         let frameCount = 0, lastFpsTime = Date.now();
         let consecutiveErrors = 0;
 
@@ -158,9 +157,98 @@
             detecting = false;
         });
 
-        const L_EYE = [33, 160, 158, 133, 153, 144];
-        const R_EYE = [362, 385, 387, 263, 373, 380];
-        const MOUTH = [61, 13, 14, 87, 178, 88, 95, 78, 191, 80, 81, 82];
+        // MediaPipe 478-point canonical landmark indices
+        const L_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133];
+        const R_EYE = [362, 382, 381, 380, 374, 373, 390, 249, 263];
+        const L_IRIS = [468, 469, 470, 471, 472];
+        const R_IRIS = [473, 474, 475, 476, 477];
+        const MOUTH = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
+        const L_BROW = [70, 63, 105, 66, 107, 55, 65, 52, 53, 46];
+        const R_BROW = [300, 293, 334, 296, 336, 285, 295, 282, 283, 276];
+        const NOSE = [168, 6, 197, 195, 5, 4, 1, 19, 94, 2];
+        const JAW = [234, 93, 132, 58, 172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288, 361, 323, 454, 356, 389];
+
+        // ==================== ALGORITHM 1: GAZE RATIO (GeoGaze 2026) ====================
+        // rho_h = (x_i - x_L) / (x_R - x_L)
+        // Thresholds: < 0.40 = RIGHT, 0.40-0.60 = CENTER, > 0.60 = LEFT
+        function computeGazeRatio(irisX, leftX, rightX) {
+            const span = rightX - leftX;
+            if (Math.abs(span) < 0.0001) return 0.5;
+            return (irisX - leftX) / span;
+        }
+
+        function estimateGaze(pts) {
+            const lRatio = computeGazeRatio(pts[468].x, pts[33].x, pts[133].x);
+            const rRatio = computeGazeRatio(pts[473].x, pts[362].x, pts[263].x);
+            const avg = (lRatio + rRatio) / 2;
+            let direction;
+            if (avg < 0.40) direction = 'right';
+            else if (avg > 0.60) direction = 'left';
+            else direction = 'center';
+            const confidence = 1.0 - 2.0 * Math.abs(avg - 0.5);
+            return { direction, ratio: avg, confidence: Math.max(0, confidence) };
+        }
+
+        // ==================== ALGORITHM 4: KALMAN IRIS TRACKER ====================
+        // State: [x, y, vx, vy] — smoothed iris position + velocity
+        class KalmanIris {
+            constructor(dt = 1/30, q = 0.03, r = 0.01) {
+                this.dt = dt;
+                this.x = [0, 0, 0, 0];
+                this.P = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+                this.q = q;
+                this.r = r;
+            }
+            _matMul4(F, P) {
+                const out = new Array(16);
+                for (let i = 0; i < 4; i++)
+                    for (let j = 0; j < 4; j++) {
+                        let s = 0;
+                        for (let k = 0; k < 4; k++) s += F[i*4+k] * P[k*4+j];
+                        out[i*4+j] = s;
+                    }
+                return out;
+            }
+            predict() {
+                const dt = this.dt;
+                const F = [1,0,dt,0, 0,1,0,dt, 0,0,1,0, 0,0,0,1];
+                const Ft = [1,0,0,0, 0,1,0,0, dt,0,1,0, 0,dt,0,1];
+                const FP = this._matMul4(F, this.P);
+                this.P = this._matMul4(FP, Ft);
+                for (let i = 0; i < 4; i++) this.P[i*4+i] += this.q;
+                const nx = F[0]*this.x[0]+F[1]*this.x[1]+F[2]*this.x[2]+F[3]*this.x[3];
+                const ny = F[4]*this.x[0]+F[5]*this.x[1]+F[6]*this.x[2]+F[7]*this.x[3];
+                const nvx = F[8]*this.x[0]+F[9]*this.x[1]+F[10]*this.x[2]+F[11]*this.x[3];
+                const nvy = F[12]*this.x[0]+F[13]*this.x[1]+F[14]*this.x[2]+F[15]*this.x[3];
+                this.x = [nx, ny, nvx, nvy];
+            }
+            update(zx, zy) {
+                const H = [1,0,0,0, 0,1,0,0];
+                const hx = this.x[0], hy = this.x[1];
+                const ey = [zx - hx, zy - hy];
+                let S00 = this.P[0]+this.r, S01 = this.P[1];
+                let S10 = this.P[4], S11 = this.P[5]+this.r;
+                const det = S00*S11 - S01*S10;
+                if (Math.abs(det) < 1e-10) return;
+                const Sinv = [S11/det, -S01/det, -S10/det, S00/det];
+                const K = [
+                    this.P[0]*Sinv[0]+this.P[1]*Sinv[2], this.P[0]*Sinv[1]+this.P[1]*Sinv[3],
+                    this.P[4]*Sinv[0]+this.P[5]*Sinv[2], this.P[4]*Sinv[1]+this.P[5]*Sinv[3],
+                    this.P[8]*Sinv[0]+this.P[9]*Sinv[2], this.P[8]*Sinv[1]+this.P[9]*Sinv[3],
+                    this.P[12]*Sinv[0]+this.P[13]*Sinv[2], this.P[12]*Sinv[1]+this.P[13]*Sinv[3]
+                ];
+                this.x[0] += K[0]*ey[0] + K[1]*ey[1];
+                this.x[1] += K[2]*ey[0] + K[3]*ey[1];
+                this.x[2] += K[4]*ey[0] + K[5]*ey[1];
+                this.x[3] += K[6]*ey[0] + K[7]*ey[1];
+                // Joseph form: P = (I-KH)P(I-KH)^T + KRK^T, simplified decay
+                for (let i = 0; i < 16; i++) this.P[i] *= 0.98;
+            }
+            getPosition() { return [this.x[0], this.x[1]]; }
+            getVelocity() { return [this.x[2], this.x[3]]; }
+        }
+        const kalmanL = new KalmanIris();
+        const kalmanR = new KalmanIris();
 
         // ==================== LOAD MODEL ====================
         async function loadModel() {
@@ -199,10 +287,12 @@
         }
 
         function calcMAR(mouth) {
-            let total = 0;
-            for (let i = 0; i < mouth.length - 1; i++) total += dist(mouth[i], mouth[i + 1]);
-            const h = dist(mouth[0], mouth[Math.floor(mouth.length / 2)]);
-            return total / (mouth.length * h + 0.001);
+            // Standard MAR: average of 3 vertical distances / horizontal distance
+            // mouth[2]=top, mouth[8]=bottom, mouth[0]=left, mouth[10]=right (approx)
+            const v1 = dist(mouth[2], mouth[8]);
+            const v2 = dist(mouth[4], mouth[6]);
+            const h = dist(mouth[0], mouth[10]);
+            return (v1 + v2) / (2.0 * h + 0.001);
         }
 
         // ==================== HEAD POSE ====================
@@ -222,19 +312,7 @@
             return { yaw: yaw * 180 / Math.PI, pitch: pitch * 180 / Math.PI, roll: roll * 180 / Math.PI };
         }
 
-        // ==================== GAZE ====================
-        function getGaze(pts) {
-            const lIn = pts[33], lOut = pts[133];
-            const rIn = pts[362], rOut = pts[263];
-            const lIris = { x: (pts[159].x + pts[145].x) / 2, y: (pts[159].y + pts[145].y) / 2 };
-            const rIris = { x: (pts[386].x + pts[374].x) / 2, y: (pts[386].y + pts[374].y) / 2 };
-            const lR = (lIris.x - lIn.x) / (lOut.x - lIn.x + 0.001);
-            const rR = (rIris.x - rIn.x) / (rOut.x - rIn.x + 0.001);
-            const avg = (lR + rR) / 2;
-            if (avg < 0.35) return 'right';
-            if (avg > 0.65) return 'left';
-            return 'center';
-        }
+        // Gaze is now handled by estimateGaze() above (Algorithm 1: Gaze Ratio)
 
         // ==================== EFFICIENT PERCLOS ====================
         function updatePERCLOS(isClosed, now) {
@@ -269,7 +347,6 @@
             if (!faceLandmarker || video.currentTime === lastVideoTime) { requestAnimationFrame(detect); return; }
 
             detecting = true;
-            lastDetectTime = now;
             lastVideoTime = video.currentTime;
 
             let results;
@@ -280,7 +357,7 @@
                 consecutiveErrors++;
                 detecting = false;
                 if (consecutiveErrors <= 3) log(`Detect error #${consecutiveErrors}: ${e.message || e}`);
-                if (consecutiveErrors > 5) { lastVideoTime = -1; log('Resetting detection after 5 errors'); }
+                if (consecutiveErrors > 5) { lastVideoTime = -1; log('Resetting after 5 errors'); }
                 requestAnimationFrame(detect);
                 return;
             }
@@ -292,7 +369,7 @@
             if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
                 calibrated = false;
                 eyesClosed = false;
-                updateUI({ face: false, ear: 0, mar: 0, gaze: '-', yaw: 0, pitch: 0, alerts: ['NO_FACE'] });
+                updateUI({ face: false, ear: 0, mar: 0, gaze: '-', gazeConf: 0, yaw: 0, pitch: 0, alerts: ['NO_FACE'] });
                 detecting = false;
                 requestAnimationFrame(detect);
                 return;
@@ -302,20 +379,7 @@
             const bs = results.faceBlendshapes && results.faceBlendshapes[0] && Array.isArray(results.faceBlendshapes[0]) ? results.faceBlendshapes[0] : [];
             const mat = results.facialTransformationMatrixes ? results.facialTransformationMatrixes[0] : null;
 
-            // Face bounding box
-            let minX = 1, maxX = 0, minY = 1, maxY = 0;
-            for (const p of lm) {
-                if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
-                if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
-            }
-            const pad = 0.08;
-            minX = Math.max(0, minX - pad); minY = Math.max(0, minY - pad);
-            maxX = Math.min(1, maxX + pad); maxY = Math.min(1, maxY + pad);
-            ctx.strokeStyle = 'rgba(0,212,255,0.4)';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(minX * w, minY * h, (maxX - minX) * w, (maxY - minY) * h);
-
-            // Helper: draw dots + thin connecting lines
+            // ---- Overlay: dots + polygon lines ----
             function drawPoly(ids, color, lw, close) {
                 ctx.strokeStyle = color;
                 ctx.fillStyle = color;
@@ -332,27 +396,34 @@
                 }
             }
 
-            // Eyes
-            drawPoly([33,7,163,144,145,153,154,155,133], '#00d4ff', 1, true);
-            drawPoly([362,382,381,380,374,373,390,249,263], '#00d4ff', 1, true);
+            // Face bounding box
+            let minX = 1, maxX = 0, minY = 1, maxY = 0;
+            for (const p of lm) {
+                if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+                if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+            }
+            const pad = 0.08;
+            ctx.strokeStyle = 'rgba(0,212,255,0.4)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(
+                Math.max(0, (minX - pad)) * w,
+                Math.max(0, (minY - pad)) * h,
+                (Math.min(1, maxX + pad) - Math.max(0, minX - pad)) * w,
+                (Math.min(1, maxY + pad) - Math.max(0, minY - pad)) * h
+            );
+
+            drawPoly(L_EYE, '#00d4ff', 1, true);
+            drawPoly(R_EYE, '#00d4ff', 1, true);
+            drawPoly(L_BROW, '#ff9800', 1.5, false);
+            drawPoly(R_BROW, '#ff9800', 1.5, false);
+            drawPoly(MOUTH, '#ff4444', 1, true);
+            drawPoly(NOSE, '#aaaaaa', 1, false);
+            drawPoly(JAW, '#666666', 1, false);
 
             // Iris center dots
             ctx.fillStyle = '#00ff00';
-            ctx.beginPath(); ctx.arc(lm[468].x*w, lm[468].y*h, 3, 0, Math.PI*2); ctx.fill();
-            ctx.beginPath(); ctx.arc(lm[473].x*w, lm[473].y*h, 3, 0, Math.PI*2); ctx.fill();
-
-            // Eyebrows
-            drawPoly([70,63,105,66,107,55,65,52,53,46], '#ff9800', 1.5, false);
-            drawPoly([300,293,334,296,336,285,295,282,283,276], '#ff9800', 1.5, false);
-
-            // Mouth
-            drawPoly([61,146,91,181,84,17,314,405,321,375,291,409,270,269,267,0,37,39,40,185], '#ff4444', 1, true);
-
-            // Nose
-            drawPoly([168,6,197,195,5,4,1,19,94,2], '#aaaaaa', 1, false);
-
-            // Jawline
-            drawPoly([234,93,132,58,172,136,150,149,176,148,152,377,400,378,379,365,397,288,361,323,454,356,389], '#666666', 1, false);
+            ctx.beginPath(); ctx.arc(lm[468].x * w, lm[468].y * h, 3, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(lm[473].x * w, lm[473].y * h, 3, 0, Math.PI * 2); ctx.fill();
 
             // 3D Axis from nose tip
             if (mat) {
@@ -361,7 +432,6 @@
                 const rx = [mat[0], mat[1], mat[2]];
                 const ry = [mat[4], mat[5], mat[6]];
                 const rz = [mat[8], mat[9], mat[10]];
-
                 ctx.lineWidth = 2.5;
                 ctx.font = 'bold 11px Arial';
 
@@ -381,7 +451,19 @@
                 ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(noseX, noseY, 3, 0, Math.PI * 2); ctx.fill();
             }
 
-            // EAR
+            // ---- Kalman iris smoothing ----
+            kalmanL.predict(); kalmanR.predict();
+            kalmanL.update(lm[468].x, lm[468].y);
+            kalmanR.update(lm[473].x, lm[473].y);
+            const [klx, kly] = kalmanL.getPosition();
+            const [krx, kry] = kalmanR.getPosition();
+
+            // Draw smoothed iris positions
+            ctx.fillStyle = '#ffff00';
+            ctx.beginPath(); ctx.arc(klx * w, kly * h, 4, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(krx * w, kry * h, 4, 0, Math.PI * 2); ctx.fill();
+
+            // ---- EAR (Eye Aspect Ratio) ----
             let ear = 0.3;
             if (bs.length > 0) {
                 const lB = bs.find(b => b.categoryName === 'eyeBlinkLeft');
@@ -392,6 +474,7 @@
             }
             ear = oneEuro(prevEAR, ear); prevEAR = ear;
 
+            // ---- MAR (Mouth Aspect Ratio) ----
             let mar = 0;
             if (bs.length > 0) {
                 const jaw = bs.find(b => b.categoryName === 'jawOpen');
@@ -401,7 +484,7 @@
             }
             mar = oneEuro(prevMAR, mar); prevMAR = mar;
 
-            // Head pose
+            // ---- Head pose (transformation matrix → euler) ----
             let yaw = 0, pitch = 0;
             if (mat) {
                 const e = matrixToEuler(mat);
@@ -423,9 +506,11 @@
 
             const adjYaw = calibrated ? yaw - baseYaw : 0;
             const adjPitch = calibrated ? pitch - basePitch : 0;
-            const gaze = calibrated ? getGaze(lm) : 'center';
 
-            // Blink tracking
+            // ---- Gaze (Algorithm 1: Gaze Ratio) ----
+            const gazeResult = calibrated ? estimateGaze(lm) : { direction: 'center', confidence: 0 };
+
+            // ---- Blink tracking ----
             const isClosed = ear < EAR_THRESHOLD;
             if (isClosed && !eyesClosed) {
                 eyesClosed = true;
@@ -445,7 +530,7 @@
             const blinkRate = getBlinkRate();
             const perclos = updatePERCLOS(isClosed, now);
 
-            if (gaze !== 'center' && calibrated) {
+            if (gazeResult.direction !== 'center' && calibrated) {
                 if (gazeOffStart === 0) gazeOffStart = now;
             } else {
                 gazeOffStart = 0;
@@ -458,23 +543,24 @@
                 setTimeout(() => { nodCooldown = false; }, 2000);
             }
 
-            // Alerts
+            // ---- Alerts ----
             const alerts = [];
-            if (perclos > PERCLOS_THRESHOLD) alerts.push('DROWSY (PERCLOS)');
+            if (perclos > PERCLOS_THRESHOLD) alerts.push('DROWSY');
             if (blinkDur > SLOW_BLINK_MS) alerts.push('SLOW_BLINK');
             if (blinkDur >= MSLEEP_MIN && blinkDur <= MSLEEP_MAX) alerts.push('MICROSLEEP');
-            if (blinkDur > 3000) alerts.push('EYES_CLOSED_3s+');
+            if (blinkDur > 3000) alerts.push('EYES_CLOSED');
             if (mar > MAR_THRESHOLD) alerts.push('YAWNING');
-            if (gazeOffDur > GAZE_OFF_THRESHOLD / 1000) alerts.push('GAZE_OFF_ROAD');
+            if (gazeOffDur > GAZE_OFF_THRESHOLD / 1000) alerts.push('GAZE_OFF');
             if (Math.abs(adjYaw) > YAW_THRESHOLD) alerts.push('LOOKING_SIDE');
-            if (nodCount >= 3) alerts.push('HEAD_NODDING');
+            if (nodCount >= 3) alerts.push('HEAD_NOD');
             if (adjPitch > PITCH_THRESHOLD) alerts.push('LOOKING_DOWN');
-            if (blinkRate < 5 && calibrated && frameIdx > 60) alerts.push('LOW_BLINK_RATE');
-            if (blinkRate > 30) alerts.push('HIGH_BLINK_RATE');
+            if (blinkRate < 5 && calibrated && frameIdx > 60) alerts.push('LOW_BLINK');
+            if (blinkRate > 30) alerts.push('HIGH_BLINK');
 
             updateUI({
                 face: true, ear: ear.toFixed(3), mar: mar.toFixed(3),
-                gaze, yaw: adjYaw.toFixed(1), pitch: adjPitch.toFixed(1),
+                gaze: gazeResult.direction, gazeConf: gazeResult.confidence,
+                yaw: adjYaw.toFixed(1), pitch: adjPitch.toFixed(1),
                 perclos: (perclos * 100).toFixed(1),
                 blinkDur: Math.round(blinkDur),
                 blinkRate, microsleepCount, gazeOffDur: gazeOffDur.toFixed(1),
@@ -494,12 +580,12 @@
 
         // ==================== UI ====================
         function updateUI(d) {
-            document.getElementById('faceVal').innerHTML = d.face ? '✅' : '❌';
+            document.getElementById('faceVal').innerHTML = d.face ? 'OK' : 'NO';
             document.getElementById('earVal').textContent = d.ear;
             document.getElementById('marVal').textContent = d.mar;
-            document.getElementById('gazeVal').textContent = d.gaze;
-            document.getElementById('yawVal').textContent = d.yaw + '°';
-            document.getElementById('pitchVal').textContent = d.pitch + '°';
+            document.getElementById('gazeVal').textContent = d.gaze + (d.gazeConf !== undefined ? ' ' + (d.gazeConf * 100).toFixed(0) + '%' : '');
+            document.getElementById('yawVal').textContent = d.yaw + '\u00B0';
+            document.getElementById('pitchVal').textContent = d.pitch + '\u00B0';
 
             const perclosEl = document.getElementById('perclosVal');
             perclosEl.textContent = d.perclos + '%';
@@ -544,7 +630,6 @@
                 frameIdx = 0;
                 calibrated = false;
                 lastVideoTime = -1;
-                lastDetectTime = 0;
                 consecutiveErrors = 0;
                 eyeClosureSum = 0;
                 eyeClosureWindowStart = 0;
