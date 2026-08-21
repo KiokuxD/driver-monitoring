@@ -274,51 +274,77 @@
                 const bs = results.faceBlendshapes ? results.faceBlendshapes[0] : null;
                 const mat = results.facialTransformationMatrixes ? results.facialTransformationMatrixes[0] : null;
 
-                // Draw face bounding box
+                const w = overlay.width, h = overlay.height;
+                const now2 = performance.now();
+
+                // Face bounding box
                 let minX = 1, maxX = 0, minY = 1, maxY = 0;
                 for (const p of lm) {
-                    if (p.x < minX) minX = p.x;
-                    if (p.x > maxX) maxX = p.x;
-                    if (p.y < minY) minY = p.y;
-                    if (p.y > maxY) maxY = p.y;
+                    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+                    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
                 }
                 const pad = 0.08;
                 minX = Math.max(0, minX - pad); minY = Math.max(0, minY - pad);
                 maxX = Math.min(1, maxX + pad); maxY = Math.min(1, maxY + pad);
-
-                const w = overlay.width, h = overlay.height;
-                ctx.strokeStyle = '#00ff00';
-                ctx.lineWidth = 2;
+                ctx.strokeStyle = 'rgba(0,212,255,0.4)';
+                ctx.lineWidth = 1;
                 ctx.strokeRect(minX * w, minY * h, (maxX - minX) * w, (maxY - minY) * h);
 
-                // Draw key landmark dots
-                ctx.fillStyle = '#00ff00';
-                ctx.lineWidth = 1;
-                const keyPts = [33, 133, 362, 263, 1, 61, 291, 10, 152, 159, 386, 145, 374];
-                for (const i of keyPts) {
+                // 3D Axis from nose tip using transformation matrix
+                if (mat) {
+                    const noseX = lm[1].x * w, noseY = lm[1].y * h;
+                    const axisLen = 60;
+
+                    // Extract rotation columns from 4x4 matrix (column-major)
+                    // X-axis (red = right)
+                    const rx = [mat[0], mat[1], mat[2]];
+                    // Y-axis (green = down)
+                    const ry = [mat[4], mat[5], mat[6]];
+                    // Z-axis (blue = forward/look direction)
+                    const rz = [mat[8], mat[9], mat[10]];
+
+                    // Draw X axis (red)
+                    ctx.strokeStyle = '#f44336';
+                    ctx.lineWidth = 2.5;
                     ctx.beginPath();
-                    ctx.arc(lm[i].x * w, lm[i].y * h, 2, 0, Math.PI * 2);
+                    ctx.moveTo(noseX, noseY);
+                    ctx.lineTo(noseX + rx[0] * axisLen, noseY + rx[1] * axisLen);
+                    ctx.stroke();
+                    ctx.fillStyle = '#f44336';
+                    ctx.font = 'bold 11px Arial';
+                    ctx.fillText('X', noseX + rx[0] * axisLen + 5, noseY + rx[1] * axisLen);
+
+                    // Draw Y axis (green)
+                    ctx.strokeStyle = '#4caf50';
+                    ctx.beginPath();
+                    ctx.moveTo(noseX, noseY);
+                    ctx.lineTo(noseX + ry[0] * axisLen, noseY + ry[1] * axisLen);
+                    ctx.stroke();
+                    ctx.fillStyle = '#4caf50';
+                    ctx.fillText('Y', noseX + ry[0] * axisLen + 5, noseY + ry[1] * axisLen);
+
+                    // Draw Z axis (blue = gaze direction)
+                    ctx.strokeStyle = '#2196f3';
+                    ctx.lineWidth = 3;
+                    ctx.beginPath();
+                    ctx.moveTo(noseX, noseY);
+                    ctx.lineTo(noseX + rz[0] * axisLen, noseY + rz[1] * axisLen);
+                    ctx.stroke();
+                    // Arrowhead
+                    const arrowX = noseX + rz[0] * axisLen;
+                    const arrowY = noseY + rz[1] * axisLen;
+                    ctx.fillStyle = '#2196f3';
+                    ctx.beginPath();
+                    ctx.arc(arrowX, arrowY, 4, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.fillText('Z (gaze)', arrowX + 6, arrowY);
+
+                    // Nose origin dot
+                    ctx.fillStyle = '#fff';
+                    ctx.beginPath();
+                    ctx.arc(noseX, noseY, 3, 0, Math.PI * 2);
                     ctx.fill();
                 }
-
-                // Draw eye contours
-                ctx.strokeStyle = '#00d4ff';
-                ctx.lineWidth = 1.5;
-                const eyeConns = [[33,160,158,133,153,144,33],[362,385,387,263,373,380,362]];
-                for (const eye of eyeConns) {
-                    ctx.beginPath();
-                    ctx.moveTo(lm[eye[0]].x * w, lm[eye[0]].y * h);
-                    for (let i = 1; i < eye.length; i++) ctx.lineTo(lm[eye[i]].x * w, lm[eye[i]].y * h);
-                    ctx.stroke();
-                }
-
-                // Draw mouth contour
-                ctx.strokeStyle = '#ff9800';
-                ctx.beginPath();
-                const mouthPts = [61,13,14,87,178,88,95,78,191,80,81,82,13];
-                ctx.moveTo(lm[mouthPts[0]].x * w, lm[mouthPts[0]].y * h);
-                for (let i = 1; i < mouthPts.length; i++) ctx.lineTo(lm[mouthPts[i]].x * w, lm[mouthPts[i]].y * h);
-                ctx.stroke();
 
                 // EAR
                 let ear = 0.3;
