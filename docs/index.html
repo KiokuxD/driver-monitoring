@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Driver Monitoring System</title>
+    <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0f0f23; color: #fff; font-family: 'Segoe UI', Arial, sans-serif; text-align: center; min-height: 100vh; padding: 10px; }
+        h1 { font-size: 1.3em; margin: 10px 0; color: #00d4ff; }
+        #videoContainer { position: relative; display: inline-block; width: 100%; max-width: 640px; }
+        #video { width: 100%; border: 2px solid #00d4ff; border-radius: 8px; transform: scaleX(-1); display: block; }
+        #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); pointer-events: none; }
+        #canvas { display: none; }
+        .controls { margin: 10px 0; }
+        .btn { background: #00d4ff; color: #000; border: none; padding: 12px 24px; border-radius: 8px; font-size: 1em; cursor: pointer; margin: 4px; font-weight: bold; }
+        .btn:active { background: #00a8cc; }
+        .btn.stop { background: #f44336; color: #fff; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .status { display: flex; justify-content: center; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
+        .card { background: #16213e; padding: 8px 12px; border-radius: 8px; min-width: 75px; }
+        .card .label { font-size: 0.65em; color: #888; }
+        .card .value { font-size: 1.1em; font-weight: bold; }
+        #alertBox { padding: 12px; border-radius: 8px; margin: 10px 0; font-weight: bold; font-size: 1em; transition: all 0.3s; }
+        .safe { background: #0a3d0a; color: #4caf50; }
+        .warning { background: #3d2a0a; color: #ff9800; }
+        .danger { background: #3d0a0a; color: #f44336; animation: pulse 0.5s infinite; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
+        #loading { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #0f0f23; display: flex; align-items: center; justify-content: center; z-index: 100; flex-direction: column; }
+        #loading.hidden { display: none; }
+        .spinner { width: 40px; height: 40px; border: 4px solid #333; border-top: 4px solid #00d4ff; border-radius: 50%; animation: spin 1s linear infinite; }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+        #fps { position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,0.6); padding: 3px 8px; border-radius: 4px; font-size: 0.75em; }
+        #history { max-height: 100px; overflow-y: auto; text-align: left; font-size: 0.8em; background: #16213e; padding: 8px; border-radius: 8px; margin-top: 10px; }
+        #history div { padding: 2px 0; border-bottom: 1px solid #1a1a3e; }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <div class="spinner"></div>
+        <p style="margin-top:15px">Loading face detection model...</p>
+        <p style="font-size:0.8em;color:#888;margin-top:5px">First time may take 30-60 seconds</p>
+    </div>
+
+    <h1>🚗 Driver Monitoring System</h1>
+
+    <div id="videoContainer">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+        <div id="fps">FPS: 0</div>
+    </div>
+
+    <div class="controls">
+        <button class="btn" id="startBtn" onclick="startCamera()">Start Camera</button>
+        <button class="btn stop" id="stopBtn" onclick="stopCamera()" disabled>Stop</button>
+        <button class="btn" onclick="resetAlerts()">Reset Alerts</button>
+    </div>
+
+    <div class="status">
+        <div class="card"><div class="label">FACE</div><div class="value" id="faceVal">-</div></div>
+        <div class="card"><div class="label">EAR</div><div class="value" id="earVal">-</div></div>
+        <div class="card"><div class="label">MAR</div><div class="value" id="marVal">-</div></div>
+        <div class="card"><div class="label">GAZE</div><div class="value" id="gazeVal">-</div></div>
+        <div class="card"><div class="label">YAW</div><div class="value" id="yawVal">-</div></div>
+        <div class="card"><div class="label">PITCH</div><div class="value" id="pitchVal">-</div></div>
+    </div>
+
+    <div id="alertBox" class="safe">SAFE - No alerts</div>
+    <div id="history"></div>
+
+    <canvas id="canvas"></canvas>
+
+    <script>
+        // ========== CONFIG ==========
+        const EAR_THRESHOLD = 0.25;
+        const EAR_CONSEC_FRAMES = 20;
+        const MAR_THRESHOLD = 0.60;
+        const MAR_CONSEC_FRAMES = 15;
+        const YAW_THRESHOLD = 30;
+        const PITCH_THRESHOLD = 25;
+
+        // ========== STATE ==========
+        let earCounter = 0;
+        let marCounter = 0;
+        let alertHistory = [];
+        let streaming = false;
+        let frameCount = 0;
+        let lastFpsTime = Date.now();
+
+        const video = document.getElementById('video');
+        const overlay = document.getElementById('overlay');
+        const overlayCtx = overlay.getContext('2d');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+
+        // ========== LOAD MODEL ==========
+        async function loadModel() {
+            const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+            await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+            await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+            document.getElementById('loading').classList.add('hidden');
+            console.log('Models loaded');
+        }
+
+        // ========== GEOMETRY UTILS ==========
+        function distance(p1, p2) {
+            return Math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2);
+        }
+
+        function calcEAR(eye) {
+            const A = distance(eye[1], eye[5]);
+            const B = distance(eye[2], eye[4]);
+            const C = distance(eye[0], eye[3]);
+            return (A + B) / (2.0 * C);
+        }
+
+        function calcMAR(mouth) {
+            const A = distance(mouth[1], mouth[7]);
+            const B = distance(mouth[2], mouth[6]);
+            const C = distance(mouth[3], mouth[5]);
+            const D = distance(mouth[0], mouth[4]);
+            return (A + B + C) / (3.0 * D);
+        }
+
+        // Eye landmark indices (68-point)
+        const LEFT_EYE = [36, 37, 38, 39, 40, 41];
+        const RIGHT_EYE = [42, 43, 44, 45, 46, 47];
+        const MOUTH = [60, 61, 62, 63, 64, 65, 66, 67];
+
+        // ========== HEAD POSE ESTIMATION ==========
+        function estimateHeadPose(landmarks, imgW, imgH) {
+            const pts = landmarks.positions;
+            // 3D model points
+            const modelPoints = [
+                [0, 0, 0],           // Nose tip (30)
+                [0, -330, -65],      // Chin (8)
+                [-225, 170, -135],   // Left eye left corner (36)
+                [225, 170, -135],    // Right eye right corner (45)
+                [-150, -150, -125],  // Left Mouth corner (48)
+                [150, -150, -125]    // Right mouth corner (54)
+            ];
+
+            const imagePoints = [
+                pts[30], pts[8], pts[36], pts[45], pts[48], pts[54]
+            ].map(p => [p.x * imgW / overlay.width, p.y * imgH / overlay.height]);
+
+            // Solve PnP approximation
+            const cx = imgW / 2;
+            const cy = imgH / 2;
+            const focal = imgW;
+
+            const rows = 3, cols = 3;
+            const cameraMatrix = [focal, 0, cx, 0, focal, cy, 0, 0, 1];
+
+            // Simple head pose from landmarks
+            const nose = pts[30];
+            const leftEye = pts[36];
+            const rightEye = pts[45];
+            const chin = pts[8];
+
+            // Yaw (left-right)
+            const eyeCenter = { x: (leftEye.x + rightEye.x) / 2, y: (leftEye.y + rightEye.y) / 2 };
+            const yaw = Math.atan2(nose.x - eyeCenter.x, 50) * (180 / Math.PI);
+
+            // Pitch (up-down)
+            const pitch = Math.atan2(chin.y - eyeCenter.y, 80) * (180 / Math.PI) - 10;
+
+            // Roll
+            const roll = Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x) * (180 / Math.PI);
+
+            return { yaw: -yaw, pitch, roll };
+        }
+
+        // ========== GAZE ESTIMATION ==========
+        function estimateGaze(landmarks) {
+            const pts = landmarks.positions;
+
+            // Left eye
+            const leftEyeInner = pts[39];
+            const leftEyeOuter = pts[36];
+            const leftIris = pts[38]; // approximate iris from upper eyelid center
+
+            // Right eye
+            const rightEyeInner = pts[42];
+            const rightEyeOuter = pts[45];
+            const rightIris = pts[44];
+
+            // Gaze ratio: iris position relative to eye corners
+            const leftRatio = (leftIris.x - leftEyeInner.x) / (leftEyeOuter.x - leftEyeInner.x + 0.001);
+            const rightRatio = (rightIris.x - rightEyeInner.x) / (rightEyeOuter.x - rightEyeInner.x + 0.001);
+            const avgRatio = (leftRatio + rightRatio) / 2;
+
+            let direction = 'center';
+            if (avgRatio < 0.40) direction = 'right';
+            else if (avgRatio > 0.60) direction = 'left';
+
+            return { direction, gaze_ratio: avgRatio };
+        }
+
+        // ========== DETECTION LOOP ==========
+        async function detect() {
+            if (!streaming) return;
+
+            const detections = await faceapi
+                .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 }))
+                .withFaceLandmarks();
+
+            // Resize overlay
+            overlay.width = video.videoWidth;
+            overlay.height = video.videoHeight;
+            overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+
+            if (detections.length === 0) {
+                updateUI({ face: false, ear: 0, mar: 0, gaze: '-', yaw: 0, pitch: 0, alerts: ['NO_FACE'] });
+                requestAnimationFrame(detect);
+                return;
+            }
+
+            const detection = detections[0];
+            const landmarks = detection.landmarks;
+            const box = detection.detection.box;
+
+            // Draw face box
+            overlayCtx.strokeStyle = '#00ff00';
+            overlayCtx.lineWidth = 2;
+            overlayCtx.strokeRect(box.x, box.y, box.width, box.height);
+
+            // Draw landmarks
+            const pts = landmarks.positions;
+            overlayCtx.fillStyle = '#00ff00';
+            for (const p of pts) {
+                overlayCtx.beginPath();
+                overlayCtx.arc(p.x, p.y, 1, 0, Math.PI * 2);
+                overlayCtx.fill();
+            }
+
+            // Calculate metrics
+            const leftEyePts = LEFT_EYE.map(i => pts[i]);
+            const rightEyePts = RIGHT_EYE.map(i => pts[i]);
+            const mouthPts = MOUTH.map(i => pts[i]);
+
+            const leftEAR = calcEAR(leftEyePts);
+            const rightEAR = calcEAR(rightEyePts);
+            const ear = (leftEAR + rightEAR) / 2;
+
+            const mar = calcMAR(mouthPts);
+
+            const headPose = estimateHeadPose(landmarks, video.videoWidth, video.videoHeight);
+            const gaze = estimateGaze(landmarks);
+
+            // Alerts
+            const alerts = [];
+
+            // Drowsiness
+            if (ear < EAR_THRESHOLD) {
+                earCounter++;
+                if (earCounter >= EAR_CONSEC_FRAMES) alerts.push('DROWSY');
+            } else {
+                earCounter = 0;
+            }
+
+            // Yawning
+            if (mar > MAR_THRESHOLD) {
+                marCounter++;
+                if (marCounter >= MAR_CONSEC_FRAMES) alerts.push('YAWNING');
+            } else {
+                marCounter = 0;
+            }
+
+            // Head pose
+            if (Math.abs(headPose.yaw) > YAW_THRESHOLD) alerts.push('LOOKING_SIDE');
+            if (headPose.pitch > PITCH_THRESHOLD) alerts.push('LOOKING_DOWN');
+
+            // Update UI
+            updateUI({
+                face: true,
+                ear: ear.toFixed(3),
+                mar: mar.toFixed(3),
+                gaze: gaze.direction,
+                yaw: headPose.yaw.toFixed(1),
+                pitch: headPose.pitch.toFixed(1),
+                alerts
+            });
+
+            // FPS
+            frameCount++;
+            if (Date.now() - lastFpsTime >= 1000) {
+                document.getElementById('fps').textContent = 'FPS: ' + frameCount;
+                frameCount = 0;
+                lastFpsTime = Date.now();
+            }
+
+            requestAnimationFrame(detect);
+        }
+
+        // ========== UI UPDATE ==========
+        function updateUI(data) {
+            document.getElementById('faceVal').innerHTML = data.face ? '✅' : '❌';
+            document.getElementById('earVal').textContent = data.ear;
+            document.getElementById('marVal').textContent = data.mar;
+            document.getElementById('gazeVal').textContent = data.gaze;
+            document.getElementById('yawVal').textContent = data.yaw + '°';
+            document.getElementById('pitchVal').textContent = data.pitch + '°';
+
+            const box = document.getElementById('alertBox');
+            if (!data.alerts || data.alerts.length === 0) {
+                box.className = 'safe';
+                box.textContent = 'SAFE - No alerts';
+            } else {
+                box.className = 'danger';
+                box.textContent = '⚠️ ' + data.alerts.join(' | ');
+
+                // Log alert
+                const hist = document.getElementById('history');
+                const div = document.createElement('div');
+                div.textContent = new Date().toLocaleTimeString() + ' - ' + data.alerts.join(', ');
+                hist.prepend(div);
+            }
+        }
+
+        // ========== CAMERA CONTROL ==========
+        async function startCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
+                });
+                video.srcObject = stream;
+                streaming = true;
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('stopBtn').disabled = false;
+                video.onloadedmetadata = () => { detect(); };
+            } catch (err) {
+                alert('Camera error: ' + err.message);
+            }
+        }
+
+        function stopCamera() {
+            streaming = false;
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(t => t.stop());
+                video.srcObject = null;
+            }
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+        }
+
+        function resetAlerts() {
+            earCounter = 0;
+            marCounter = 0;
+            document.getElementById('alertBox').className = 'safe';
+            document.getElementById('alertBox').textContent = 'SAFE - Alerts reset';
+        }
+
+        // ========== INIT ==========
+        loadModel();
+    </script>
+</body>
+</html>
