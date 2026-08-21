@@ -151,6 +151,7 @@
         window.onerror = (msg, src, line, col, err) => {
             log(`❌ JS ERROR: ${msg} (${line}:${col})`);
             detecting = false;
+            if (streaming) requestAnimationFrame(detect);
         };
         window.addEventListener('unhandledrejection', (e) => {
             log(`❌ PROMISE REJECT: ${e.reason}`);
@@ -559,7 +560,8 @@
                 const valid = (i) => lm[i] ? `(${lm[i].x.toFixed(2)},${lm[i].y.toFixed(2)})` : '??';
                 log(`EYE L: ${L_EYE_CONTOUR.map(valid).join(' ')}`);
                 log(`EYE R: ${R_EYE_CONTOUR.map(valid).join(' ')}`);
-                log(`MAT: ${mat && mat[0] != null ? `[${mat[0].toFixed(2)},${mat[1].toFixed(2)},${mat[2].toFixed(2)}]...yaw=${yaw.toFixed(1)} pitch=${pitch.toFixed(1)}` : 'null'}`);
+                const matOk = mat && mat[0] != null && mat[1] != null && mat[2] != null;
+                log(`MAT: ${matOk ? `[${mat[0].toFixed(2)},${mat[1].toFixed(2)},${mat[2].toFixed(2)}]...yaw=${yaw.toFixed(1)} pitch=${pitch.toFixed(1)}` : 'null'}`);
             }
 
             if (gazeResult.direction !== 'center' && calibrated) {
