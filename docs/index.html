@@ -250,13 +250,26 @@
         }
 
         // ==================== DETECT ====================
+        let detecting = false;
+
         function detect() {
             if (!streaming) return;
 
+            if (detecting) { requestAnimationFrame(detect); return; }
+
             if (video.currentTime !== lastVideoTime && faceLandmarker) {
+                detecting = true;
                 lastVideoTime = video.currentTime;
                 const now = performance.now();
-                const results = faceLandmarker.detectForVideo(video, now);
+
+                let results;
+                try {
+                    results = faceLandmarker.detectForVideo(video, now);
+                } catch (e) {
+                    detecting = false;
+                    requestAnimationFrame(detect);
+                    return;
+                }
 
                 if (overlay.width !== video.videoWidth) overlay.width = video.videoWidth;
                 if (overlay.height !== video.videoHeight) overlay.height = video.videoHeight;
@@ -493,6 +506,7 @@
                 }
             }
 
+            detecting = false;
             requestAnimationFrame(detect);
         }
 
