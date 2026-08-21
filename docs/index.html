@@ -158,8 +158,12 @@
         });
 
         // MediaPipe 478-point canonical landmark indices
-        const L_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133];
-        const R_EYE = [362, 382, 381, 380, 374, 373, 390, 249, 263];
+        // EAR: 6 key points per eye (2 horizontal + 4 vertical)
+        const L_EYE = [33, 160, 158, 133, 153, 144];
+        const R_EYE = [362, 385, 387, 263, 373, 380];
+        // Full eye contour for overlay drawing
+        const L_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133];
+        const R_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263];
         const L_IRIS = [468, 469, 470, 471, 472];
         const R_IRIS = [473, 474, 475, 476, 477];
         const MOUTH = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
@@ -412,8 +416,8 @@
                 (Math.min(1, maxY + pad) - Math.max(0, minY - pad)) * h
             );
 
-            drawPoly(L_EYE, '#00d4ff', 1, true);
-            drawPoly(R_EYE, '#00d4ff', 1, true);
+            drawPoly(L_EYE_CONTOUR, '#00d4ff', 1, true);
+            drawPoly(R_EYE_CONTOUR, '#00d4ff', 1, true);
             drawPoly(L_BROW, '#ff9800', 1.5, false);
             drawPoly(R_BROW, '#ff9800', 1.5, false);
             drawPoly(MOUTH, '#ff4444', 1, true);
@@ -473,6 +477,14 @@
                 ear = (calcEAR(L_EYE.map(i => lm[i])) + calcEAR(R_EYE.map(i => lm[i]))) / 2;
             }
             ear = oneEuro(prevEAR, ear); prevEAR = ear;
+
+            // Log EAR every 30 frames for debugging
+            if (frameIdx % 30 === 0) {
+                const lEar = calcEAR(L_EYE.map(i => lm[i]));
+                const rEar = calcEAR(R_EYE.map(i => lm[i]));
+                const lB = bs.length > 0 ? bs.find(b => b.categoryName === 'eyeBlinkLeft') : null;
+                log(`EAR: L=${lEar.toFixed(3)} R=${rEar.toFixed(3)} blend=${lB ? lB.score.toFixed(3) : 'N/A'} final=${ear.toFixed(3)} closed=${ear < EAR_THRESHOLD}`);
+            }
 
             // ---- MAR (Mouth Aspect Ratio) ----
             let mar = 0;
