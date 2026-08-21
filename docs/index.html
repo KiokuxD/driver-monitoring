@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Driver Monitoring System</title>
-    <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { background: #0f0f23; color: #fff; font-family: 'Segoe UI', Arial, sans-serif; text-align: center; min-height: 100vh; padding: 10px; }
@@ -12,7 +11,6 @@
         #videoContainer { position: relative; display: inline-block; width: 100%; max-width: 640px; }
         #video { width: 100%; border: 2px solid #00d4ff; border-radius: 8px; transform: scaleX(-1); display: block; }
         #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); pointer-events: none; }
-        #canvas { display: none; }
         .controls { margin: 10px 0; }
         .btn { background: #00d4ff; color: #000; border: none; padding: 12px 24px; border-radius: 8px; font-size: 1em; cursor: pointer; margin: 4px; font-weight: bold; }
         .btn:active { background: #00a8cc; }
@@ -34,12 +32,13 @@
         #fps { position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,0.6); padding: 3px 8px; border-radius: 4px; font-size: 0.75em; }
         #history { max-height: 100px; overflow-y: auto; text-align: left; font-size: 0.8em; background: #16213e; padding: 8px; border-radius: 8px; margin-top: 10px; }
         #history div { padding: 2px 0; border-bottom: 1px solid #1a1a3e; }
+        #debug { font-size: 0.7em; color: #666; margin-top: 5px; }
     </style>
 </head>
 <body>
     <div id="loading">
         <div class="spinner"></div>
-        <p style="margin-top:15px">Loading face detection model...</p>
+        <p style="margin-top:15px">Loading MediaPipe Face Landmarker...</p>
         <p style="font-size:0.8em;color:#888;margin-top:5px">First time may take 30-60 seconds</p>
     </div>
 
@@ -54,7 +53,7 @@
     <div class="controls">
         <button class="btn" id="startBtn" onclick="startCamera()">Start Camera</button>
         <button class="btn stop" id="stopBtn" onclick="stopCamera()" disabled>Stop</button>
-        <button class="btn" onclick="resetAlerts()">Reset Alerts</button>
+        <button class="btn" onclick="resetAlerts()">Reset</button>
     </div>
 
     <div class="status">
@@ -68,254 +67,266 @@
 
     <div id="alertBox" class="safe">SAFE - No alerts</div>
     <div id="history"></div>
+    <div id="debug"></div>
 
-    <canvas id="canvas"></canvas>
+    <script type="module">
+        // ========== IMPORTS ==========
+        import { FaceLandmarker, FilesetResolver, DrawingUtils } from
+            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs";
 
-    <script>
         // ========== CONFIG ==========
         const EAR_THRESHOLD = 0.25;
-        const EAR_CONSEC_FRAMES = 20;
+        const EAR_CONSEC = 20;
         const MAR_THRESHOLD = 0.60;
-        const MAR_CONSEC_FRAMES = 15;
+        const MAR_CONSEC = 15;
         const YAW_THRESHOLD = 25;
         const PITCH_THRESHOLD = 20;
-        const POSE_CONSEC_FRAMES = 15;
-        const SMOOTHING = 0.35;
+        const POSE_CONSEC = 15;
 
         // ========== STATE ==========
-        let earCounter = 0;
-        let marCounter = 0;
-        let yawCounter = 0;
-        let pitchCounter = 0;
+        let faceLandmarker = null;
         let streaming = false;
-        let frameCount = 0;
-        let lastFpsTime = Date.now();
-        let calibrated = false;
-        let baselinePitch = 0;
-        let baselineYaw = 0;
-        let frameIndex = 0;
+        let earCnt = 0, marCnt = 0, yawCnt = 0, pitchCnt = 0;
+        let frameIdx = 0;
+        let baseYaw = 0, basePitch = 0, calibrated = false;
+        let lastVideoTime = -1;
+        let frameCount = 0, lastFpsTime = Date.now();
 
-        // Smoothed values
-        let smEAR = 0, smMAR = 0, smYaw = 0, smPitch = 0;
+        // One Euro Filter params
+        let prevEAR = 0.3, prevMAR = 0.1, prevYaw = 0, prevPitch = 0;
+        const beta = 0.7, alpha = 0.15;
+
+        function oneEuro(prev, raw) {
+            const diff = Math.abs(raw - prev);
+            const rate = diff * 30;
+            const c = 1.0 / (1.0 + (1.0 / beta) * Math.exp(-rate * alpha));
+            return prev + c * (raw - prev);
+        }
 
         const video = document.getElementById('video');
         const overlay = document.getElementById('overlay');
-        const overlayCtx = overlay.getContext('2d');
+        const ctx = overlay.getContext('2d');
 
-        const LEFT_EYE = [36, 37, 38, 39, 40, 41];
-        const RIGHT_EYE = [42, 43, 44, 45, 46, 47];
-        const MOUTH = [60, 61, 62, 63, 64, 65, 66, 67];
+        // ========== LANDMARK INDICES (478-point) ==========
+        const L_EYE = [33, 160, 158, 133, 153, 144];
+        const R_EYE = [362, 385, 387, 263, 373, 380];
+        const MOUTH = [61, 13, 14, 87, 178, 88, 95, 78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95];
 
         // ========== LOAD MODEL ==========
         async function loadModel() {
-            const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
-            await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
-            await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
+            );
+            faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numFaces: 1,
+                minFaceDetectionConfidence: 0.3,
+                minFacePresenceConfidence: 0.3,
+                minTrackingConfidence: 0.3,
+                outputFaceBlendshapes: true,
+                outputFacialTransformationMatrixes: true
+            });
             document.getElementById('loading').classList.add('hidden');
         }
 
         // ========== GEOMETRY ==========
         function dist(a, b) {
-            return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+            return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + ((a.z || 0) - (b.z || 0)) ** 2);
         }
 
         function calcEAR(eye) {
             const v1 = dist(eye[1], eye[5]);
             const v2 = dist(eye[2], eye[4]);
             const h = dist(eye[0], eye[3]);
-            return (v1 + v2) / (2.0 * h);
+            return (v1 + v2) / (2.0 * h + 0.001);
         }
 
         function calcMAR(mouth) {
-            const v1 = dist(mouth[1], mouth[7]);
-            const v2 = dist(mouth[2], mouth[6]);
-            const v3 = dist(mouth[3], mouth[5]);
-            const h = dist(mouth[0], mouth[4]);
-            return (v1 + v2 + v3) / (3.0 * h);
+            let total = 0;
+            for (let i = 0; i < mouth.length - 1; i++) {
+                total += dist(mouth[i], mouth[i + 1]);
+            }
+            const h = dist(mouth[0], mouth[Math.floor(mouth.length / 2)]);
+            return total / (mouth.length * h + 0.001);
         }
 
-        function smooth(prev, raw) {
-            return prev * (1 - SMOOTHING) + raw * SMOOTHING;
+        // ========== HEAD POSE FROM MATRIX ==========
+        function matrixToEuler(m) {
+            // m is 4x4 flattened column-major
+            const sy = Math.sqrt(m[0] * m[0] + m[1] * m[1]);
+            const singular = sy < 1e-6;
+            let yaw, pitch, roll;
+            if (!singular) {
+                yaw = Math.atan2(m[8], m[10]);
+                pitch = Math.atan2(-m[9], sy);
+                roll = Math.atan2(m[1], m[5]);
+            } else {
+                yaw = Math.atan2(-m[2], m[10]);
+                pitch = Math.atan2(-m[9], sy);
+                roll = 0;
+            }
+            return {
+                yaw: yaw * 180 / Math.PI,
+                pitch: pitch * 180 / Math.PI,
+                roll: roll * 180 / Math.PI
+            };
         }
 
-        // ========== HEAD POSE ==========
-        function getHeadPose(pts) {
-            const nose = pts[30];
-            const leftEye = pts[36];
-            const rightEye = pts[45];
-            const forehead = pts[27];
-            const chin = pts[8];
-
-            const eyeCx = (leftEye.x + rightEye.x) / 2;
-            const eyeCy = (leftEye.y + rightEye.y) / 2;
-            const eyeW = dist(leftEye, rightEye);
-            const faceH = dist(forehead, chin);
-
-            // Yaw: nose horizontal offset relative to eye width
-            const rawYaw = ((nose.x - eyeCx) / eyeW) * 50;
-
-            // Pitch: nose vertical offset relative to face height
-            const faceMidY = (forehead.y + chin.y) / 2;
-            const rawPitch = ((nose.y - faceMidY) / (faceH * 0.5)) * 50;
-
-            return { rawYaw, rawPitch };
-        }
-
-        // ========== GAZE ==========
+        // ========== GAZE FROM LANDMARKS ==========
         function getGaze(pts) {
-            const lInner = pts[39], lOuter = pts[36];
-            const rInner = pts[42], rOuter = pts[45];
+            const lIn = pts[33], lOut = pts[133];
+            const rIn = pts[362], rOut = pts[263];
 
-            const lIris = { x: (pts[37].x + pts[38].x) / 2, y: (pts[37].y + pts[38].y) / 2 };
-            const rIris = { x: (pts[43].x + pts[44].x) / 2, y: (pts[43].y + pts[44].y) / 2 };
+            // Approximate iris center from eye contour midpoints
+            const lIris = { x: (pts[159].x + pts[145].x) / 2, y: (pts[159].y + pts[145].y) / 2 };
+            const rIris = { x: (pts[386].x + pts[374].x) / 2, y: (pts[386].y + pts[374].y) / 2 };
 
-            const lRatio = (lIris.x - lInner.x) / (lOuter.x - lInner.x + 0.001);
-            const rRatio = (rIris.x - rInner.x) / (rOuter.x - rInner.x + 0.001);
-            const avg = (lRatio + rRatio) / 2;
+            const lR = (lIris.x - lIn.x) / (lOut.x - lIn.x + 0.001);
+            const rR = (rIris.x - rIn.x) / (rOut.x - rIn.x + 0.001);
+            const avg = (lR + rR) / 2;
 
             if (avg < 0.35) return 'right';
             if (avg > 0.65) return 'left';
             return 'center';
         }
 
-        // ========== OCCLUSION DETECTION ==========
-        function checkOcclusion(pts, box, score) {
-            // 1. Very low detection confidence
-            if (score < 0.4) return true;
-
-            // 2. Eye aspect ratio sanity — both eyes should have EAR > 0.15 when open
-            const lEAR = calcEAR(LEFT_EYE.map(i => pts[i]));
-            const rEAR = calcEAR(RIGHT_EYE.map(i => pts[i]));
-            const earDiff = Math.abs(lEAR - rEAR);
-
-            // One eye much smaller than the other = likely occluded
-            if (earDiff > 0.15) return true;
-
-            // 3. Eyes too close together or too far apart relative to face box
-            const eyeW = dist(pts[36], pts[45]);
-            const faceW = box.width;
-            const eyeRatio = eyeW / faceW;
-
-            // Normal: eyes ~25-65% of face width
-            if (eyeRatio < 0.15 || eyeRatio > 0.75) return true;
-
-            return false;
-        }
-
-        // ========== DETECT ==========
-        async function detect() {
+        // ========== DETECTION LOOP ==========
+        function detect() {
             if (!streaming) return;
 
-            const det = await faceapi
-                .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.3 }))
-                .withFaceLandmarks();
+            if (video.currentTime !== lastVideoTime && faceLandmarker) {
+                lastVideoTime = video.currentTime;
 
-            overlay.width = video.videoWidth;
-            overlay.height = video.videoHeight;
-            overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+                const results = faceLandmarker.detectForVideo(video, performance.now());
 
-            if (det.length === 0) {
-                calibrated = false;
-                updateUI({ face: false, ear: 0, mar: 0, gaze: '-', yaw: 0, pitch: 0, alerts: ['NO_FACE'] });
-                requestAnimationFrame(detect);
-                return;
+                overlay.width = video.videoWidth;
+                overlay.height = video.videoHeight;
+                ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+                if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
+                    calibrated = false;
+                    updateUI({ face: false, ear: 0, mar: 0, gaze: '-', yaw: 0, pitch: 0, alerts: ['NO_FACE'] });
+                    requestAnimationFrame(detect);
+                    return;
+                }
+
+                const landmarks = results.faceLandmarks[0];
+                const blendshapes = results.faceBlendshapes ? results.faceBlendshapes[0] : null;
+                const matrix = results.facialTransformationMatrixes ? results.facialTransformationMatrixes[0] : null;
+
+                // Draw landmarks
+                ctx.fillStyle = '#00ff00';
+                for (const p of landmarks) {
+                    ctx.beginPath();
+                    ctx.arc(p.x * overlay.width, p.y * overlay.height, 1.5, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+
+                // EAR from blendshapes (most accurate)
+                let ear = 0.3;
+                if (blendshapes) {
+                    const lBlink = blendshapes.find(b => b.categoryName === 'eyeBlinkLeft');
+                    const rBlink = blendshapes.find(b => b.categoryName === 'eyeBlinkRight');
+                    const lOpen = lBlink ? 1 - lBlink.score : 0.5;
+                    const rOpen = rBlink ? 1 - rBlink.score : 0.5;
+                    ear = (lOpen + rOpen) / 2;
+                } else {
+                    ear = (calcEAR(L_EYE.map(i => landmarks[i])) + calcEAR(R_EYE.map(i => landmarks[i]))) / 2;
+                }
+                ear = oneEuro(prevEAR, ear);
+                prevEAR = ear;
+
+                // MAR from blendshapes
+                let mar = 0;
+                if (blendshapes) {
+                    const jawOpen = blendshapes.find(b => b.categoryName === 'jawOpen');
+                    mar = jawOpen ? jawOpen.score : 0;
+                } else {
+                    mar = calcMAR(MOUTH.slice(0, 12).map(i => landmarks[i]));
+                }
+                mar = oneEuro(prevMAR, mar);
+                prevMAR = mar;
+
+                // Head pose from transformation matrix (most accurate)
+                let yaw = 0, pitch = 0;
+                if (matrix) {
+                    const euler = matrixToEuler(matrix);
+                    yaw = euler.yaw;
+                    pitch = euler.pitch;
+                } else {
+                    // Fallback: geometric estimation
+                    const nose = landmarks[1];
+                    const lEye = landmarks[33];
+                    const rEye = landmarks[263];
+                    const forehead = landmarks[10];
+                    const chin = landmarks[152];
+                    const eyeCx = (lEye.x + rEye.x) / 2;
+                    const eyeW = dist(lEye, rEye);
+                    const faceH = dist(forehead, chin);
+                    const faceMidY = (forehead.y + chin.y) / 2;
+                    yaw = ((nose.x - eyeCx) / eyeW) * 50;
+                    pitch = ((nose.y - faceMidY) / (faceH * 0.5)) * 50;
+                }
+                yaw = oneEuro(prevYaw, yaw);
+                pitch = oneEuro(prevPitch, pitch);
+                prevYaw = yaw;
+                prevPitch = pitch;
+
+                // Calibration
+                frameIdx++;
+                if (frameIdx <= 30) {
+                    baseYaw = yaw;
+                    basePitch = pitch;
+                    calibrated = false;
+                } else {
+                    calibrated = true;
+                }
+
+                const adjYaw = calibrated ? yaw - baseYaw : 0;
+                const adjPitch = calibrated ? pitch - basePitch : 0;
+
+                // Gaze
+                const gaze = calibrated ? getGaze(landmarks) : 'center';
+
+                // ===== ALERTS =====
+                const alerts = [];
+
+                if (ear < EAR_THRESHOLD) { earCnt++; if (earCnt >= EAR_CONSEC) alerts.push('DROWSY'); }
+                else earCnt = 0;
+
+                if (mar > MAR_THRESHOLD) { marCnt++; if (marCnt >= MAR_CONSEC) alerts.push('YAWNING'); }
+                else marCnt = 0;
+
+                if (Math.abs(adjYaw) > YAW_THRESHOLD) { yawCnt++; if (yawCnt >= POSE_CONSEC) alerts.push('LOOKING_SIDE'); }
+                else yawCnt = 0;
+
+                if (adjPitch > PITCH_THRESHOLD) { pitchCnt++; if (pitchCnt >= POSE_CONSEC) alerts.push('LOOKING_DOWN'); }
+                else pitchCnt = 0;
+
+                updateUI({
+                    face: true, ear: ear.toFixed(3), mar: mar.toFixed(3),
+                    gaze, yaw: adjYaw.toFixed(1), pitch: adjPitch.toFixed(1), alerts
+                });
+
+                // FPS
+                frameCount++;
+                if (Date.now() - lastFpsTime >= 1000) {
+                    document.getElementById('fps').textContent = 'FPS: ' + frameCount;
+                    frameCount = 0;
+                    lastFpsTime = Date.now();
+                }
             }
 
-            const d = det[0];
-            const pts = d.landmarks.positions;
-            const box = d.detection.box;
-            const score = d.detection.score;
-
-            // Occlusion check
-            const occluded = checkOcclusion(pts, box, score);
-
-            // Draw — color based on occlusion
-            overlayCtx.strokeStyle = occluded ? '#ff9800' : '#00ff00';
-            overlayCtx.lineWidth = 2;
-            overlayCtx.strokeRect(box.x, box.y, box.width, box.height);
-            overlayCtx.fillStyle = occluded ? '#ff9800' : '#00ff00';
-            for (const p of pts) {
-                overlayCtx.beginPath();
-                overlayCtx.arc(p.x, p.y, 1.5, 0, Math.PI * 2);
-                overlayCtx.fill();
-            }
-            if (occluded) {
-                overlayCtx.font = '16px Arial';
-                overlayCtx.fillStyle = '#ff9800';
-                overlayCtx.fillText('OCCLUDED', box.x, box.y - 8);
-            }
-
-            // EAR
-            const rawEAR = (calcEAR(LEFT_EYE.map(i => pts[i])) + calcEAR(RIGHT_EYE.map(i => pts[i]))) / 2;
-            smEAR = smooth(smEAR, rawEAR);
-
-            // MAR
-            const rawMAR = calcMAR(MOUTH.map(i => pts[i]));
-            smMAR = smooth(smMAR, rawMAR);
-
-            // Head pose
-            const pose = getHeadPose(pts);
-            smYaw = smooth(smYaw, pose.rawYaw);
-            smPitch = smooth(smPitch, pose.rawPitch);
-
-            // Calibrate on first 30 frames (capture neutral pose)
-            frameIndex++;
-            if (frameIndex <= 30) {
-                baselineYaw = smYaw;
-                baselinePitch = smPitch;
-                calibrated = false;
-            } else {
-                calibrated = true;
-            }
-
-            const adjYaw = calibrated ? smYaw - baselineYaw : 0;
-            const adjPitch = calibrated ? smPitch - baselinePitch : 0;
-
-            // Gaze
-            const gaze = calibrated ? getGaze(pts) : 'center';
-
-            // ===== ALERTS =====
-            const alerts = [];
-
-            if (occluded) {
-                alerts.push('FACE_OCCLUDED');
-                earCounter = marCounter = yawCounter = pitchCounter = 0;
-            } else {
-                // Drowsy
-                if (smEAR < EAR_THRESHOLD) { earCounter++; if (earCounter >= EAR_CONSEC_FRAMES) alerts.push('DROWSY'); }
-                else earCounter = 0;
-
-                // Yawning
-                if (smMAR > MAR_THRESHOLD) { marCounter++; if (marCounter >= MAR_CONSEC_FRAMES) alerts.push('YAWNING'); }
-                else marCounter = 0;
-
-                // Looking side
-                if (Math.abs(adjYaw) > YAW_THRESHOLD) { yawCounter++; if (yawCounter >= POSE_CONSEC_FRAMES) alerts.push('LOOKING_SIDE'); }
-                else yawCounter = 0;
-
-                // Looking down
-                if (adjPitch > PITCH_THRESHOLD) { pitchCounter++; if (pitchCounter >= POSE_CONSEC_FRAMES) alerts.push('LOOKING_DOWN'); }
-                else pitchCounter = 0;
-            }
-
-            updateUI({
-                face: true, occluded, ear: smEAR.toFixed(3), mar: smMAR.toFixed(3),
-                gaze, yaw: adjYaw.toFixed(1), pitch: adjPitch.toFixed(1), alerts
-            });
-
-            frameCount++;
-            if (Date.now() - lastFpsTime >= 1000) {
-                document.getElementById('fps').textContent = 'FPS: ' + frameCount;
-                frameCount = 0;
-                lastFpsTime = Date.now();
-            }
             requestAnimationFrame(detect);
         }
 
         // ========== UI ==========
         function updateUI(data) {
-            const faceIcon = data.occluded ? '⚠️' : (data.face ? '✅' : '❌');
-            document.getElementById('faceVal').innerHTML = faceIcon;
+            document.getElementById('faceVal').innerHTML = data.face ? '✅' : '❌';
             document.getElementById('earVal').textContent = data.ear;
             document.getElementById('marVal').textContent = data.mar;
             document.getElementById('gazeVal').textContent = data.gaze;
@@ -344,11 +355,11 @@
                 });
                 video.srcObject = stream;
                 streaming = true;
-                frameIndex = 0;
+                frameIdx = 0;
                 calibrated = false;
                 document.getElementById('startBtn').disabled = true;
                 document.getElementById('stopBtn').disabled = false;
-                video.onloadedmetadata = () => detect();
+                video.onloadedmetadata = () => { detect(); };
             } catch (err) {
                 alert('Camera error: ' + err.message);
             }
@@ -359,16 +370,21 @@
             if (video.srcObject) { video.srcObject.getTracks().forEach(t => t.stop()); video.srcObject = null; }
             document.getElementById('startBtn').disabled = false;
             document.getElementById('stopBtn').disabled = true;
-            overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+            ctx.clearRect(0, 0, overlay.width, overlay.height);
         }
 
         function resetAlerts() {
-            earCounter = marCounter = yawCounter = pitchCounter = 0;
-            frameIndex = 0;
+            earCnt = marCnt = yawCnt = pitchCnt = 0;
+            frameIdx = 0;
             calibrated = false;
             document.getElementById('alertBox').className = 'safe';
             document.getElementById('alertBox').textContent = 'SAFE - Alerts reset';
         }
+
+        // Expose to global for button onclick
+        window.startCamera = startCamera;
+        window.stopCamera = stopCamera;
+        window.resetAlerts = resetAlerts;
 
         loadModel();
     </script>
