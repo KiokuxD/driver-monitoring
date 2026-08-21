@@ -77,22 +77,34 @@
         const EAR_CONSEC_FRAMES = 20;
         const MAR_THRESHOLD = 0.60;
         const MAR_CONSEC_FRAMES = 15;
-        const YAW_THRESHOLD = 30;
-        const PITCH_THRESHOLD = 35;
+        const YAW_THRESHOLD = 25;
+        const PITCH_THRESHOLD = 20;
+        const POSE_CONSEC_FRAMES = 15;
+        const SMOOTHING = 0.35;
 
         // ========== STATE ==========
         let earCounter = 0;
         let marCounter = 0;
-        let alertHistory = [];
+        let yawCounter = 0;
+        let pitchCounter = 0;
         let streaming = false;
         let frameCount = 0;
         let lastFpsTime = Date.now();
+        let calibrated = false;
+        let baselinePitch = 0;
+        let baselineYaw = 0;
+        let frameIndex = 0;
+
+        // Smoothed values
+        let smEAR = 0, smMAR = 0, smYaw = 0, smPitch = 0;
 
         const video = document.getElementById('video');
         const overlay = document.getElementById('overlay');
         const overlayCtx = overlay.getContext('2d');
-        const canvas = document.getElementById('canvas');
-        const ctx = canvas.getContext('2d');
+
+        const LEFT_EYE = [36, 37, 38, 39, 40, 41];
+        const RIGHT_EYE = [42, 43, 44, 45, 46, 47];
+        const MOUTH = [60, 61, 62, 63, 64, 65, 66, 67];
 
         // ========== LOAD MODEL ==========
         async function loadModel() {
@@ -100,189 +112,169 @@
             await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
             await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
             document.getElementById('loading').classList.add('hidden');
-            console.log('Models loaded');
         }
 
-        // ========== GEOMETRY UTILS ==========
-        function distance(p1, p2) {
-            return Math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2);
+        // ========== GEOMETRY ==========
+        function dist(a, b) {
+            return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
         }
 
         function calcEAR(eye) {
-            const A = distance(eye[1], eye[5]);
-            const B = distance(eye[2], eye[4]);
-            const C = distance(eye[0], eye[3]);
-            return (A + B) / (2.0 * C);
+            const v1 = dist(eye[1], eye[5]);
+            const v2 = dist(eye[2], eye[4]);
+            const h = dist(eye[0], eye[3]);
+            return (v1 + v2) / (2.0 * h);
         }
 
         function calcMAR(mouth) {
-            const A = distance(mouth[1], mouth[7]);
-            const B = distance(mouth[2], mouth[6]);
-            const C = distance(mouth[3], mouth[5]);
-            const D = distance(mouth[0], mouth[4]);
-            return (A + B + C) / (3.0 * D);
+            const v1 = dist(mouth[1], mouth[7]);
+            const v2 = dist(mouth[2], mouth[6]);
+            const v3 = dist(mouth[3], mouth[5]);
+            const h = dist(mouth[0], mouth[4]);
+            return (v1 + v2 + v3) / (3.0 * h);
         }
 
-        // Eye landmark indices (68-point)
-        const LEFT_EYE = [36, 37, 38, 39, 40, 41];
-        const RIGHT_EYE = [42, 43, 44, 45, 46, 47];
-        const MOUTH = [60, 61, 62, 63, 64, 65, 66, 67];
+        function smooth(prev, raw) {
+            return prev * (1 - SMOOTHING) + raw * SMOOTHING;
+        }
 
-        // ========== HEAD POSE ESTIMATION ==========
-        function estimateHeadPose(landmarks) {
-            const pts = landmarks.positions;
+        // ========== HEAD POSE ==========
+        function getHeadPose(pts) {
+            const nose = pts[30];
+            const leftEye = pts[36];
+            const rightEye = pts[45];
+            const forehead = pts[27];
+            const chin = pts[8];
 
-            const nose = pts[30];       // Nose tip
-            const leftEye = pts[36];    // Left eye corner
-            const rightEye = pts[45];   // Right eye corner
-            const forehead = pts[27];   // Nose bridge top (between eyebrows)
-            const chin = pts[8];        // Chin
+            const eyeCx = (leftEye.x + rightEye.x) / 2;
+            const eyeCy = (leftEye.y + rightEye.y) / 2;
+            const eyeW = dist(leftEye, rightEye);
+            const faceH = dist(forehead, chin);
 
-            const eyeCenter = {
-                x: (leftEye.x + rightEye.x) / 2,
-                y: (leftEye.y + rightEye.y) / 2
-            };
+            // Yaw: nose horizontal offset relative to eye width
+            const rawYaw = ((nose.x - eyeCx) / eyeW) * 50;
 
-            const eyeWidth = distance(leftEye, rightEye);
-            const faceHeight = distance(forehead, chin);
-
-            // Yaw (left-right turn): nose horizontal offset from eye center
-            const yaw = Math.atan2(nose.x - eyeCenter.x, eyeWidth) * (180 / Math.PI);
-
-            // Pitch (up-down): nose vertical position relative to face midpoint
+            // Pitch: nose vertical offset relative to face height
             const faceMidY = (forehead.y + chin.y) / 2;
-            const noseOffset = nose.y - faceMidY;
-            const pitch = (noseOffset / (faceHeight / 2)) * 45;
+            const rawPitch = ((nose.y - faceMidY) / (faceH * 0.5)) * 50;
 
-            // Roll (tilt)
-            const roll = Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x) * (180 / Math.PI);
-
-            return { yaw, pitch, roll };
+            return { rawYaw, rawPitch };
         }
 
-        // ========== GAZE ESTIMATION ==========
-        function estimateGaze(landmarks) {
-            const pts = landmarks.positions;
+        // ========== GAZE ==========
+        function getGaze(pts) {
+            const lInner = pts[39], lOuter = pts[36];
+            const rInner = pts[42], rOuter = pts[45];
 
-            // Left eye
-            const leftEyeInner = pts[39];
-            const leftEyeOuter = pts[36];
-            const leftIris = pts[38]; // approximate iris from upper eyelid center
+            const lIris = { x: (pts[37].x + pts[38].x) / 2, y: (pts[37].y + pts[38].y) / 2 };
+            const rIris = { x: (pts[43].x + pts[44].x) / 2, y: (pts[43].y + pts[44].y) / 2 };
 
-            // Right eye
-            const rightEyeInner = pts[42];
-            const rightEyeOuter = pts[45];
-            const rightIris = pts[44];
+            const lRatio = (lIris.x - lInner.x) / (lOuter.x - lInner.x + 0.001);
+            const rRatio = (rIris.x - rInner.x) / (rOuter.x - rInner.x + 0.001);
+            const avg = (lRatio + rRatio) / 2;
 
-            // Gaze ratio: iris position relative to eye corners
-            const leftRatio = (leftIris.x - leftEyeInner.x) / (leftEyeOuter.x - leftEyeInner.x + 0.001);
-            const rightRatio = (rightIris.x - rightEyeInner.x) / (rightEyeOuter.x - rightEyeInner.x + 0.001);
-            const avgRatio = (leftRatio + rightRatio) / 2;
-
-            let direction = 'center';
-            if (avgRatio < 0.40) direction = 'right';
-            else if (avgRatio > 0.60) direction = 'left';
-
-            return { direction, gaze_ratio: avgRatio };
+            if (avg < 0.35) return 'right';
+            if (avg > 0.65) return 'left';
+            return 'center';
         }
 
-        // ========== DETECTION LOOP ==========
+        // ========== DETECT ==========
         async function detect() {
             if (!streaming) return;
 
-            const detections = await faceapi
-                .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 }))
+            const det = await faceapi
+                .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.5 }))
                 .withFaceLandmarks();
 
-            // Resize overlay
             overlay.width = video.videoWidth;
             overlay.height = video.videoHeight;
             overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
 
-            if (detections.length === 0) {
+            if (det.length === 0) {
+                calibrated = false;
                 updateUI({ face: false, ear: 0, mar: 0, gaze: '-', yaw: 0, pitch: 0, alerts: ['NO_FACE'] });
                 requestAnimationFrame(detect);
                 return;
             }
 
-            const detection = detections[0];
-            const landmarks = detection.landmarks;
-            const box = detection.detection.box;
+            const d = det[0];
+            const pts = d.landmarks.positions;
+            const box = d.detection.box;
 
-            // Draw face box
+            // Draw
             overlayCtx.strokeStyle = '#00ff00';
             overlayCtx.lineWidth = 2;
             overlayCtx.strokeRect(box.x, box.y, box.width, box.height);
-
-            // Draw landmarks
-            const pts = landmarks.positions;
             overlayCtx.fillStyle = '#00ff00';
             for (const p of pts) {
                 overlayCtx.beginPath();
-                overlayCtx.arc(p.x, p.y, 1, 0, Math.PI * 2);
+                overlayCtx.arc(p.x, p.y, 1.5, 0, Math.PI * 2);
                 overlayCtx.fill();
             }
 
-            // Calculate metrics
-            const leftEyePts = LEFT_EYE.map(i => pts[i]);
-            const rightEyePts = RIGHT_EYE.map(i => pts[i]);
-            const mouthPts = MOUTH.map(i => pts[i]);
+            // EAR
+            const rawEAR = (calcEAR(LEFT_EYE.map(i => pts[i])) + calcEAR(RIGHT_EYE.map(i => pts[i]))) / 2;
+            smEAR = smooth(smEAR, rawEAR);
 
-            const leftEAR = calcEAR(leftEyePts);
-            const rightEAR = calcEAR(rightEyePts);
-            const ear = (leftEAR + rightEAR) / 2;
-
-            const mar = calcMAR(mouthPts);
-
-            const headPose = estimateHeadPose(landmarks);
-            const gaze = estimateGaze(landmarks);
-
-            // Alerts
-            const alerts = [];
-
-            // Drowsiness
-            if (ear < EAR_THRESHOLD) {
-                earCounter++;
-                if (earCounter >= EAR_CONSEC_FRAMES) alerts.push('DROWSY');
-            } else {
-                earCounter = 0;
-            }
-
-            // Yawning
-            if (mar > MAR_THRESHOLD) {
-                marCounter++;
-                if (marCounter >= MAR_CONSEC_FRAMES) alerts.push('YAWNING');
-            } else {
-                marCounter = 0;
-            }
+            // MAR
+            const rawMAR = calcMAR(MOUTH.map(i => pts[i]));
+            smMAR = smooth(smMAR, rawMAR);
 
             // Head pose
-            if (Math.abs(headPose.yaw) > YAW_THRESHOLD) alerts.push('LOOKING_SIDE');
-            if (headPose.pitch > PITCH_THRESHOLD) alerts.push('LOOKING_DOWN');
+            const pose = getHeadPose(pts);
+            smYaw = smooth(smYaw, pose.rawYaw);
+            smPitch = smooth(smPitch, pose.rawPitch);
 
-            // Update UI
+            // Calibrate on first 30 frames (capture neutral pose)
+            frameIndex++;
+            if (frameIndex <= 30) {
+                baselineYaw = smYaw;
+                baselinePitch = smPitch;
+                calibrated = false;
+            } else {
+                calibrated = true;
+            }
+
+            const adjYaw = calibrated ? smYaw - baselineYaw : 0;
+            const adjPitch = calibrated ? smPitch - baselinePitch : 0;
+
+            // Gaze
+            const gaze = calibrated ? getGaze(pts) : 'center';
+
+            // ===== ALERTS =====
+            const alerts = [];
+
+            // Drowsy
+            if (smEAR < EAR_THRESHOLD) { earCounter++; if (earCounter >= EAR_CONSEC_FRAMES) alerts.push('DROWSY'); }
+            else earCounter = 0;
+
+            // Yawning
+            if (smMAR > MAR_THRESHOLD) { marCounter++; if (marCounter >= MAR_CONSEC_FRAMES) alerts.push('YAWNING'); }
+            else marCounter = 0;
+
+            // Looking side
+            if (Math.abs(adjYaw) > YAW_THRESHOLD) { yawCounter++; if (yawCounter >= POSE_CONSEC_FRAMES) alerts.push('LOOKING_SIDE'); }
+            else yawCounter = 0;
+
+            // Looking down
+            if (adjPitch > PITCH_THRESHOLD) { pitchCounter++; if (pitchCounter >= POSE_CONSEC_FRAMES) alerts.push('LOOKING_DOWN'); }
+            else pitchCounter = 0;
+
             updateUI({
-                face: true,
-                ear: ear.toFixed(3),
-                mar: mar.toFixed(3),
-                gaze: gaze.direction,
-                yaw: headPose.yaw.toFixed(1),
-                pitch: headPose.pitch.toFixed(1),
-                alerts
+                face: true, ear: smEAR.toFixed(3), mar: smMAR.toFixed(3),
+                gaze, yaw: adjYaw.toFixed(1), pitch: adjPitch.toFixed(1), alerts
             });
 
-            // FPS
             frameCount++;
             if (Date.now() - lastFpsTime >= 1000) {
                 document.getElementById('fps').textContent = 'FPS: ' + frameCount;
                 frameCount = 0;
                 lastFpsTime = Date.now();
             }
-
             requestAnimationFrame(detect);
         }
 
-        // ========== UI UPDATE ==========
+        // ========== UI ==========
         function updateUI(data) {
             document.getElementById('faceVal').innerHTML = data.face ? '✅' : '❌';
             document.getElementById('earVal').textContent = data.ear;
@@ -298,8 +290,6 @@
             } else {
                 box.className = 'danger';
                 box.textContent = '⚠️ ' + data.alerts.join(' | ');
-
-                // Log alert
                 const hist = document.getElementById('history');
                 const div = document.createElement('div');
                 div.textContent = new Date().toLocaleTimeString() + ' - ' + data.alerts.join(', ');
@@ -307,7 +297,7 @@
             }
         }
 
-        // ========== CAMERA CONTROL ==========
+        // ========== CAMERA ==========
         async function startCamera() {
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({
@@ -315,9 +305,11 @@
                 });
                 video.srcObject = stream;
                 streaming = true;
+                frameIndex = 0;
+                calibrated = false;
                 document.getElementById('startBtn').disabled = true;
                 document.getElementById('stopBtn').disabled = false;
-                video.onloadedmetadata = () => { detect(); };
+                video.onloadedmetadata = () => detect();
             } catch (err) {
                 alert('Camera error: ' + err.message);
             }
@@ -325,23 +317,20 @@
 
         function stopCamera() {
             streaming = false;
-            if (video.srcObject) {
-                video.srcObject.getTracks().forEach(t => t.stop());
-                video.srcObject = null;
-            }
+            if (video.srcObject) { video.srcObject.getTracks().forEach(t => t.stop()); video.srcObject = null; }
             document.getElementById('startBtn').disabled = false;
             document.getElementById('stopBtn').disabled = true;
             overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
         }
 
         function resetAlerts() {
-            earCounter = 0;
-            marCounter = 0;
+            earCounter = marCounter = yawCounter = pitchCounter = 0;
+            frameIndex = 0;
+            calibrated = false;
             document.getElementById('alertBox').className = 'safe';
             document.getElementById('alertBox').textContent = 'SAFE - Alerts reset';
         }
 
-        // ========== INIT ==========
         loadModel();
     </script>
 </body>
