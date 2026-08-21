@@ -158,13 +158,12 @@
         });
 
         // MediaPipe 478-point canonical landmark indices
-        // EAR: 6 key points per eye (proven to work)
+        // EAR: 6 key points per eye
         const L_EYE = [33, 160, 158, 133, 153, 144];
         const R_EYE = [362, 385, 387, 263, 373, 380];
-        // Eye contour for overlay: upper lid + lower lid + corners
-        // Left: outer(33) → upper(159,158) → inner(133) → lower(145,144) → outer
-        const L_EYE_CONTOUR = [33, 159, 158, 133, 145, 144];
-        const R_EYE_CONTOUR = [362, 386, 387, 263, 374, 373];
+        // Eye contour for overlay: just use the 6 EAR points + iris center
+        const L_EYE_CONTOUR = [33, 160, 158, 133, 153, 144];
+        const R_EYE_CONTOUR = [362, 385, 387, 263, 373, 380];
         const L_IRIS = [468, 469, 470, 471, 472];
         const R_IRIS = [473, 474, 475, 476, 477];
         const MOUTH = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
@@ -525,14 +524,6 @@
             yaw = oneEuro(prevYaw, yaw); pitch = oneEuro(prevPitch, pitch);
             prevYaw = yaw; prevPitch = pitch;
 
-            // Debug matrix every 60 frames
-            if (frameIdx % 60 === 0 && mat) {
-                const m = mat;
-                log(`MAT: [${m[0].toFixed(2)},${m[1].toFixed(2)},${m[2].toFixed(2)},${m[3].toFixed(2)}] [${m[4].toFixed(2)},${m[5].toFixed(2)},${m[6].toFixed(2)},${m[7].toFixed(2)}] [${m[8].toFixed(2)},${m[9].toFixed(2)},${m[10].toFixed(2)},${m[11].toFixed(2)}] yaw=${yaw.toFixed(1)} pitch=${pitch.toFixed(1)}`);
-            } else if (frameIdx % 60 === 0) {
-                log(`MAT: null, using fallback yaw=${yaw.toFixed(1)} pitch=${pitch.toFixed(1)}`);
-            }
-
             frameIdx++;
             if (frameIdx <= 30) { baseYaw = yaw; basePitch = pitch; calibrated = false; }
             else calibrated = true;
@@ -563,18 +554,12 @@
             const blinkRate = getBlinkRate();
             const perclos = updatePERCLOS(isClosed, now);
 
-            // Debug: log eye landmark y-positions to verify contour shape
+            // Debug: log eye landmark positions
             if (frameIdx % 120 === 0) {
-                const eyePts = L_EYE_CONTOUR.map(i => {
-                    const p = lm[i];
-                    return p ? `${i}(${p.x.toFixed(2)},${p.y.toFixed(2)})` : `${i}??`;
-                }).join(' ');
-                const rPts = R_EYE_CONTOUR.map(i => {
-                    const p = lm[i];
-                    return p ? `${i}(${p.x.toFixed(2)},${p.y.toFixed(2)})` : `${i}??`;
-                }).join(' ');
-                log(`EYE L: ${eyePts}`);
-                log(`EYE R: ${rPts}`);
+                const valid = (i) => lm[i] ? `(${lm[i].x.toFixed(2)},${lm[i].y.toFixed(2)})` : '??';
+                log(`EYE L: ${L_EYE_CONTOUR.map(valid).join(' ')}`);
+                log(`EYE R: ${R_EYE_CONTOUR.map(valid).join(' ')}`);
+                log(`MAT: ${mat ? `[${mat[0].toFixed(2)},${mat[1].toFixed(2)},${mat[2].toFixed(2)}]...yaw=${yaw.toFixed(1)} pitch=${pitch.toFixed(1)}` : 'null'}`);
             }
 
             if (gazeResult.direction !== 'center' && calibrated) {
