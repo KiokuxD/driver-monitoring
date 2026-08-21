@@ -178,6 +178,40 @@
             return 'center';
         }
 
+        // ========== OCCLUSION DETECTION ==========
+        function checkOcclusion(pts, box, score) {
+            // 1. Low detection confidence
+            if (score < 0.6) return true;
+
+            // 2. Eye aspect ratio sanity — both eyes should have EAR > 0.15 when open
+            const lEAR = calcEAR(LEFT_EYE.map(i => pts[i]));
+            const rEAR = calcEAR(RIGHT_EYE.map(i => pts[i]));
+            const earDiff = Math.abs(lEAR - rEAR);
+
+            // One eye much smaller than the other = likely occluded
+            if (earDiff > 0.12) return true;
+
+            // 3. Eyes too close together or too far apart relative to face box
+            const eyeW = dist(pts[36], pts[45]);
+            const faceW = box.width;
+            const eyeRatio = eyeW / faceW;
+
+            // Normal: eyes ~35-55% of face width
+            if (eyeRatio < 0.20 || eyeRatio > 0.70) return true;
+
+            // 4. Nose should be between eyes vertically
+            const nose = pts[30];
+            const eyeTop = Math.min(pts[37].y, pts[38].y, pts[43].y, pts[44].y);
+            const eyeBot = Math.max(pts[40].y, pts[41].y, pts[46].y, pts[47].y);
+            if (nose.y < eyeTop - 15 || nose.y > eyeBot + 40) return true;
+
+            // 5. Mouth should be below nose
+            const mouthTop = pts[61].y;
+            if (mouthTop < nose.y) return true;
+
+            return false;
+        }
+
         // ========== DETECT ==========
         async function detect() {
             if (!streaming) return;
@@ -200,16 +234,25 @@
             const d = det[0];
             const pts = d.landmarks.positions;
             const box = d.detection.box;
+            const score = d.detection.score;
 
-            // Draw
-            overlayCtx.strokeStyle = '#00ff00';
+            // Occlusion check
+            const occluded = checkOcclusion(pts, box, score);
+
+            // Draw — color based on occlusion
+            overlayCtx.strokeStyle = occluded ? '#ff9800' : '#00ff00';
             overlayCtx.lineWidth = 2;
             overlayCtx.strokeRect(box.x, box.y, box.width, box.height);
-            overlayCtx.fillStyle = '#00ff00';
+            overlayCtx.fillStyle = occluded ? '#ff9800' : '#00ff00';
             for (const p of pts) {
                 overlayCtx.beginPath();
                 overlayCtx.arc(p.x, p.y, 1.5, 0, Math.PI * 2);
                 overlayCtx.fill();
+            }
+            if (occluded) {
+                overlayCtx.font = '16px Arial';
+                overlayCtx.fillStyle = '#ff9800';
+                overlayCtx.fillText('OCCLUDED', box.x, box.y - 8);
             }
 
             // EAR
@@ -244,24 +287,29 @@
             // ===== ALERTS =====
             const alerts = [];
 
-            // Drowsy
-            if (smEAR < EAR_THRESHOLD) { earCounter++; if (earCounter >= EAR_CONSEC_FRAMES) alerts.push('DROWSY'); }
-            else earCounter = 0;
+            if (occluded) {
+                alerts.push('FACE_OCCLUDED');
+                earCounter = marCounter = yawCounter = pitchCounter = 0;
+            } else {
+                // Drowsy
+                if (smEAR < EAR_THRESHOLD) { earCounter++; if (earCounter >= EAR_CONSEC_FRAMES) alerts.push('DROWSY'); }
+                else earCounter = 0;
 
-            // Yawning
-            if (smMAR > MAR_THRESHOLD) { marCounter++; if (marCounter >= MAR_CONSEC_FRAMES) alerts.push('YAWNING'); }
-            else marCounter = 0;
+                // Yawning
+                if (smMAR > MAR_THRESHOLD) { marCounter++; if (marCounter >= MAR_CONSEC_FRAMES) alerts.push('YAWNING'); }
+                else marCounter = 0;
 
-            // Looking side
-            if (Math.abs(adjYaw) > YAW_THRESHOLD) { yawCounter++; if (yawCounter >= POSE_CONSEC_FRAMES) alerts.push('LOOKING_SIDE'); }
-            else yawCounter = 0;
+                // Looking side
+                if (Math.abs(adjYaw) > YAW_THRESHOLD) { yawCounter++; if (yawCounter >= POSE_CONSEC_FRAMES) alerts.push('LOOKING_SIDE'); }
+                else yawCounter = 0;
 
-            // Looking down
-            if (adjPitch > PITCH_THRESHOLD) { pitchCounter++; if (pitchCounter >= POSE_CONSEC_FRAMES) alerts.push('LOOKING_DOWN'); }
-            else pitchCounter = 0;
+                // Looking down
+                if (adjPitch > PITCH_THRESHOLD) { pitchCounter++; if (pitchCounter >= POSE_CONSEC_FRAMES) alerts.push('LOOKING_DOWN'); }
+                else pitchCounter = 0;
+            }
 
             updateUI({
-                face: true, ear: smEAR.toFixed(3), mar: smMAR.toFixed(3),
+                face: true, occluded, ear: smEAR.toFixed(3), mar: smMAR.toFixed(3),
                 gaze, yaw: adjYaw.toFixed(1), pitch: adjPitch.toFixed(1), alerts
             });
 
@@ -276,7 +324,8 @@
 
         // ========== UI ==========
         function updateUI(data) {
-            document.getElementById('faceVal').innerHTML = data.face ? '✅' : '❌';
+            const faceIcon = data.occluded ? '⚠️' : (data.face ? '✅' : '❌');
+            document.getElementById('faceVal').innerHTML = faceIcon;
             document.getElementById('earVal').textContent = data.ear;
             document.getElementById('marVal').textContent = data.mar;
             document.getElementById('gazeVal').textContent = data.gaze;
