@@ -284,36 +284,46 @@
         }
 
         function calcEAR(eye) {
+            // eye = [p0, p1, p2, p3, p4, p5]
+            // p0=outer corner, p3=inner corner (horizontal)
+            // p1,p5=vertical left side, p2,p4=vertical right side
             const v1 = dist(eye[1], eye[5]);
             const v2 = dist(eye[2], eye[4]);
             const h = dist(eye[0], eye[3]);
-            return (v1 + v2) / (2.0 * h + 0.001);
+            if (h < 0.001) return 0.3;
+            return (v1 + v2) / (2.0 * h);
         }
 
         function calcMAR(mouth) {
-            // Standard MAR: average of 3 vertical distances / horizontal distance
-            // mouth[2]=top, mouth[8]=bottom, mouth[0]=left, mouth[10]=right (approx)
-            const v1 = dist(mouth[2], mouth[8]);
-            const v2 = dist(mouth[4], mouth[6]);
-            const h = dist(mouth[0], mouth[10]);
-            return (v1 + v2) / (2.0 * h + 0.001);
+            // mouth has 20 points. Use 3 vertical pairs / horizontal
+            const v1 = dist(mouth[2], mouth[8]);   // top vs bottom
+            const v2 = dist(mouth[4], mouth[6]);   // mid-top vs mid-bottom
+            const v3 = dist(mouth[1], mouth[9]);   // left side
+            const h = dist(mouth[0], mouth[10]);   // left vs right corner
+            if (h < 0.001) return 0;
+            return (v1 + v2 + v3) / (3.0 * h);
         }
 
         // ==================== HEAD POSE ====================
         function matrixToEuler(m) {
-            const sy = Math.sqrt(m[0] * m[0] + m[1] * m[1]);
-            const singular = sy < 1e-6;
+            // m is a flat 16-element Float32Array (column-major 4x4 matrix)
+            // Access as m[col*4 + row]
+            const r00 = m[0], r01 = m[4], r02 = m[8];
+            const r10 = m[1], r11 = m[5], r12 = m[9];
+            const r20 = m[2], r21 = m[6], r22 = m[10];
+
             let yaw, pitch, roll;
-            if (!singular) {
-                yaw = Math.atan2(m[8], m[10]);
-                pitch = Math.atan2(-m[9], sy);
-                roll = Math.atan2(m[1], m[5]);
-            } else {
-                yaw = Math.atan2(-m[2], m[10]);
-                pitch = Math.atan2(-m[9], sy);
+            // Check for gimbal lock
+            if (Math.abs(r20) > 0.999) {
+                pitch = Math.atan2(-r02, r11) * 180 / Math.PI;
+                yaw = r20 > 0 ? -90 : 90;
                 roll = 0;
+            } else {
+                yaw = Math.atan2(r12, r22) * 180 / Math.PI;
+                pitch = Math.atan2(-r02, Math.sqrt(r00*r00 + r01*r01)) * 180 / Math.PI;
+                roll = Math.atan2(r01, r00) * 180 / Math.PI;
             }
-            return { yaw: yaw * 180 / Math.PI, pitch: pitch * 180 / Math.PI, roll: roll * 180 / Math.PI };
+            return { yaw, pitch, roll };
         }
 
         // Gaze is now handled by estimateGaze() above (Algorithm 1: Gaze Ratio)
@@ -433,9 +443,10 @@
             if (mat) {
                 const noseX = lm[1].x * w, noseY = lm[1].y * h;
                 const axisLen = 60;
-                const rx = [mat[0], mat[1], mat[2]];
-                const ry = [mat[4], mat[5], mat[6]];
-                const rz = [mat[8], mat[9], mat[10]];
+                // mat is flat column-major: mat[col*4 + row]
+                const rx = [mat[0], mat[1]]; // X axis (first column)
+                const ry = [mat[4], mat[5]]; // Y axis (second column)
+                const rz = [mat[8], mat[9]]; // Z axis (third column)
                 ctx.lineWidth = 2.5;
                 ctx.font = 'bold 11px Arial';
 
@@ -482,8 +493,10 @@
             if (frameIdx % 30 === 0) {
                 const lEar = calcEAR(L_EYE.map(i => lm[i]));
                 const rEar = calcEAR(R_EYE.map(i => lm[i]));
-                const lB = bs.length > 0 ? bs.find(b => b.categoryName === 'eyeBlinkLeft') : null;
-                log(`EAR: L=${lEar.toFixed(3)} R=${rEar.toFixed(3)} blend=${lB ? lB.score.toFixed(3) : 'N/A'} final=${ear.toFixed(3)} closed=${ear < EAR_THRESHOLD}`);
+                const lB = bs.find(b => b.categoryName === 'eyeBlinkLeft');
+                const rB = bs.find(b => b.categoryName === 'eyeBlinkRight');
+                const bsInfo = lB ? `bsL=${lB.score.toFixed(2)} bsR=${rB.score.toFixed(2)}` : 'no blendshapes';
+                log(`EAR: L=${lEar.toFixed(3)} R=${rEar.toFixed(3)} ${bsInfo} final=${ear.toFixed(3)} thr=${EAR_THRESHOLD}`);
             }
 
             // ---- MAR (Mouth Aspect Ratio) ----
