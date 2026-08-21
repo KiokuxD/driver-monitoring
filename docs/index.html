@@ -300,7 +300,7 @@
             }
 
             const lm = results.faceLandmarks[0];
-            const bs = results.faceBlendshapes ? results.faceBlendshapes[0] : null;
+            const bs = results.faceBlendshapes && results.faceBlendshapes[0] && Array.isArray(results.faceBlendshapes[0]) ? results.faceBlendshapes[0] : [];
             const mat = results.facialTransformationMatrixes ? results.facialTransformationMatrixes[0] : null;
 
             // Face bounding box
@@ -345,7 +345,7 @@
 
             // EAR
             let ear = 0.3;
-            if (bs) {
+            if (bs.length > 0) {
                 const lB = bs.find(b => b.categoryName === 'eyeBlinkLeft');
                 const rB = bs.find(b => b.categoryName === 'eyeBlinkRight');
                 ear = ((lB ? 1 - lB.score : 0.5) + (rB ? 1 - rB.score : 0.5)) / 2;
@@ -354,9 +354,8 @@
             }
             ear = oneEuro(prevEAR, ear); prevEAR = ear;
 
-            // MAR
             let mar = 0;
-            if (bs) {
+            if (bs.length > 0) {
                 const jaw = bs.find(b => b.categoryName === 'jawOpen');
                 mar = jaw ? jaw.score : 0;
             } else {
