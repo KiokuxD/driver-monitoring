@@ -258,8 +258,8 @@
                 const now = performance.now();
                 const results = faceLandmarker.detectForVideo(video, now);
 
-                overlay.width = video.videoWidth;
-                overlay.height = video.videoHeight;
+                if (overlay.width !== video.videoWidth) overlay.width = video.videoWidth;
+                if (overlay.height !== video.videoHeight) overlay.height = video.videoHeight;
                 ctx.clearRect(0, 0, overlay.width, overlay.height);
 
                 if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
@@ -274,13 +274,51 @@
                 const bs = results.faceBlendshapes ? results.faceBlendshapes[0] : null;
                 const mat = results.facialTransformationMatrixes ? results.facialTransformationMatrixes[0] : null;
 
-                // Draw
-                ctx.fillStyle = '#00ff00';
+                // Draw face bounding box
+                let minX = 1, maxX = 0, minY = 1, maxY = 0;
                 for (const p of lm) {
+                    if (p.x < minX) minX = p.x;
+                    if (p.x > maxX) maxX = p.x;
+                    if (p.y < minY) minY = p.y;
+                    if (p.y > maxY) maxY = p.y;
+                }
+                const pad = 0.08;
+                minX = Math.max(0, minX - pad); minY = Math.max(0, minY - pad);
+                maxX = Math.min(1, maxX + pad); maxY = Math.min(1, maxY + pad);
+
+                const w = overlay.width, h = overlay.height;
+                ctx.strokeStyle = '#00ff00';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(minX * w, minY * h, (maxX - minX) * w, (maxY - minY) * h);
+
+                // Draw key landmark dots
+                ctx.fillStyle = '#00ff00';
+                ctx.lineWidth = 1;
+                const keyPts = [33, 133, 362, 263, 1, 61, 291, 10, 152, 159, 386, 145, 374];
+                for (const i of keyPts) {
                     ctx.beginPath();
-                    ctx.arc(p.x * overlay.width, p.y * overlay.height, 1.5, 0, Math.PI * 2);
+                    ctx.arc(lm[i].x * w, lm[i].y * h, 2, 0, Math.PI * 2);
                     ctx.fill();
                 }
+
+                // Draw eye contours
+                ctx.strokeStyle = '#00d4ff';
+                ctx.lineWidth = 1.5;
+                const eyeConns = [[33,160,158,133,153,144,33],[362,385,387,263,373,380,362]];
+                for (const eye of eyeConns) {
+                    ctx.beginPath();
+                    ctx.moveTo(lm[eye[0]].x * w, lm[eye[0]].y * h);
+                    for (let i = 1; i < eye.length; i++) ctx.lineTo(lm[eye[i]].x * w, lm[eye[i]].y * h);
+                    ctx.stroke();
+                }
+
+                // Draw mouth contour
+                ctx.strokeStyle = '#ff9800';
+                ctx.beginPath();
+                const mouthPts = [61,13,14,87,178,88,95,78,191,80,81,82,13];
+                ctx.moveTo(lm[mouthPts[0]].x * w, lm[mouthPts[0]].y * h);
+                for (let i = 1; i < mouthPts.length; i++) ctx.lineTo(lm[mouthPts[i]].x * w, lm[mouthPts[i]].y * h);
+                ctx.stroke();
 
                 // EAR
                 let ear = 0.3;
