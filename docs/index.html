@@ -306,14 +306,13 @@
 
         // ==================== HEAD POSE ====================
         function matrixToEuler(m) {
-            // m is a flat 16-element Float32Array (column-major 4x4 matrix)
-            // Access as m[col*4 + row]
-            const r00 = m[0], r01 = m[4], r02 = m[8];
-            const r10 = m[1], r11 = m[5], r12 = m[9];
-            const r20 = m[2], r21 = m[6], r22 = m[10];
+            // m is a flat 16-element Float32Array (ROW-major 4x4 matrix)
+            // Access as m[row*4 + col]
+            const r00 = m[0], r01 = m[1], r02 = m[2];
+            const r10 = m[4], r11 = m[5], r12 = m[6];
+            const r20 = m[8], r21 = m[9], r22 = m[10];
 
             let yaw, pitch, roll;
-            // Check for gimbal lock
             if (Math.abs(r20) > 0.999) {
                 pitch = Math.atan2(-r02, r11) * 180 / Math.PI;
                 yaw = r20 > 0 ? -90 : 90;
@@ -443,10 +442,10 @@
             if (mat) {
                 const noseX = lm[1].x * w, noseY = lm[1].y * h;
                 const axisLen = 60;
-                // mat is flat column-major: mat[col*4 + row]
-                const rx = [mat[0], mat[1]]; // X axis (first column)
-                const ry = [mat[4], mat[5]]; // Y axis (second column)
-                const rz = [mat[8], mat[9]]; // Z axis (third column)
+                // mat is flat ROW-major: mat[row*4 + col]
+                const rx = [mat[0], mat[4]]; // X axis (first row → screen x,y)
+                const ry = [mat[1], mat[5]]; // Y axis (second row)
+                const rz = [mat[2], mat[6]]; // Z axis (third row)
                 ctx.lineWidth = 2.5;
                 ctx.font = 'bold 11px Arial';
 
@@ -554,6 +553,11 @@
             const blinkDur = eyesClosed ? (now - blinkStart) : 0;
             const blinkRate = getBlinkRate();
             const perclos = updatePERCLOS(isClosed, now);
+
+            // Debug blink every 60 frames
+            if (frameIdx % 60 === 0) {
+                log(`BLINK: closed=${isClosed} eyesClosed=${eyesClosed} dur=${blinkDur} rate=${blinkRate} perclos=${(perclos*100).toFixed(1)}% blinks=${blinkTimestamps.length}`);
+            }
 
             if (gazeResult.direction !== 'center' && calibrated) {
                 if (gazeOffStart === 0) gazeOffStart = now;
