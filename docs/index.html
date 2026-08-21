@@ -316,6 +316,63 @@
             ctx.lineWidth = 1;
             ctx.strokeRect(minX * w, minY * h, (maxX - minX) * w, (maxY - minY) * h);
 
+            // Helper: draw contour from landmark indices
+            function drawContour(indices, color, lineWidth, close) {
+                ctx.strokeStyle = color;
+                ctx.lineWidth = lineWidth;
+                ctx.beginPath();
+                ctx.moveTo(lm[indices[0]].x * w, lm[indices[0]].y * h);
+                for (let i = 1; i < indices.length; i++) ctx.lineTo(lm[indices[i]].x * w, lm[indices[i]].y * h);
+                if (close) ctx.closePath();
+                ctx.stroke();
+            }
+
+            // Helper: draw filled dot
+            function drawDot(idx, color, r) {
+                ctx.fillStyle = color;
+                ctx.beginPath();
+                ctx.arc(lm[idx].x * w, lm[idx].y * h, r, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            // Left eye contour (478-point)
+            drawContour([33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246,33], '#00d4ff', 1.5, false);
+
+            // Right eye contour
+            drawContour([362,382,381,380,374,373,390,249,263,466,388,387,386,385,384,398,362], '#00d4ff', 1.5, false);
+
+            // Left iris
+            drawDot(468, '#00ff00', 3);
+            drawDot(469, '#00ff00', 1.5);
+            drawDot(470, '#00ff00', 1.5);
+            drawDot(471, '#00ff00', 1.5);
+            drawDot(472, '#00ff00', 1.5);
+
+            // Right iris
+            drawDot(473, '#00ff00', 3);
+            drawDot(474, '#00ff00', 1.5);
+            drawDot(475, '#00ff00', 1.5);
+            drawDot(476, '#00ff00', 1.5);
+            drawDot(477, '#00ff00', 1.5);
+
+            // Left eyebrow
+            drawContour([70,63,105,66,107,55,65,52,53,46,70], '#ff9800', 2, false);
+
+            // Right eyebrow
+            drawContour([300,293,334,296,336,285,295,282,283,276,300], '#ff9800', 2, false);
+
+            // Mouth contour
+            drawContour([61,146,91,181,84,17,314,405,321,375,291,409,270,269,267,0,37,39,40,185], '#ff4444', 2, false);
+
+            // Lips inner
+            drawContour([78,95,88,178,87,14,317,402,318,324,308,415,310,311,312,13,82,81,80,191], '#ff6666', 1, false);
+
+            // Chin contour
+            drawContour([152,377,400,378,379,365,397,288,361,323,454,356,389,323], '#888', 1, false);
+
+            // Nose line
+            drawContour([168,6,197,195,5,4,1,19,94,2], '#aaa', 1, false);
+
             // 3D Axis from nose tip
             if (mat) {
                 const noseX = lm[1].x * w, noseY = lm[1].y * h;
