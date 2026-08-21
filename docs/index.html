@@ -494,7 +494,7 @@
                 const rEar = calcEAR(R_EYE.map(i => lm[i]));
                 const lB = bs.find(b => b.categoryName === 'eyeBlinkLeft');
                 const rB = bs.find(b => b.categoryName === 'eyeBlinkRight');
-                const bsInfo = lB ? `bsL=${lB.score.toFixed(2)} bsR=${rB.score.toFixed(2)}` : 'no blendshapes';
+                const bsInfo = `bsL=${lB ? lB.score.toFixed(2) : '??'} bsR=${rB ? rB.score.toFixed(2) : '??'}`;
                 log(`EAR: L=${lEar.toFixed(3)} R=${rEar.toFixed(3)} ${bsInfo} final=${ear.toFixed(3)} thr=${EAR_THRESHOLD}`);
             }
 
@@ -559,7 +559,7 @@
                 const valid = (i) => lm[i] ? `(${lm[i].x.toFixed(2)},${lm[i].y.toFixed(2)})` : '??';
                 log(`EYE L: ${L_EYE_CONTOUR.map(valid).join(' ')}`);
                 log(`EYE R: ${R_EYE_CONTOUR.map(valid).join(' ')}`);
-                log(`MAT: ${mat ? `[${mat[0].toFixed(2)},${mat[1].toFixed(2)},${mat[2].toFixed(2)}]...yaw=${yaw.toFixed(1)} pitch=${pitch.toFixed(1)}` : 'null'}`);
+                log(`MAT: ${mat && mat[0] != null ? `[${mat[0].toFixed(2)},${mat[1].toFixed(2)},${mat[2].toFixed(2)}]...yaw=${yaw.toFixed(1)} pitch=${pitch.toFixed(1)}` : 'null'}`);
             }
 
             if (gazeResult.direction !== 'center' && calibrated) {
