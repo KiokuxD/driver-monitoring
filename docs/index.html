@@ -98,7 +98,7 @@
         const SLOW_BLINK_MS = 500;
         const GAZE_OFF_THRESHOLD = 3000;
         const NOD_THRESHOLD = 18;
-        const MIN_DETECT_INTERVAL = 50;
+        const MIN_DETECT_INTERVAL = 100;
 
         // ==================== STATE ====================
         let faceLandmarker = null;
@@ -152,7 +152,7 @@
             faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
                 baseOptions: {
                     modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
-                    delegate: "GPU"
+                    delegate: "CPU"
                 },
                 runningMode: "VIDEO",
                 numFaces: 1,
