@@ -16,10 +16,13 @@
         .btn:active { background: #00a8cc; }
         .btn.stop { background: #f44336; color: #fff; }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        .status { display: flex; justify-content: center; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
-        .card { background: #16213e; padding: 8px 12px; border-radius: 8px; min-width: 75px; }
-        .card .label { font-size: 0.65em; color: #888; }
-        .card .value { font-size: 1.1em; font-weight: bold; }
+        .status { display: flex; justify-content: center; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+        .card { background: #16213e; padding: 6px 10px; border-radius: 8px; min-width: 68px; }
+        .card .label { font-size: 0.6em; color: #888; }
+        .card .value { font-size: 0.95em; font-weight: bold; }
+        .card.warn .value { color: #ff9800; }
+        .card.danger .value { color: #f44336; }
+        .card.ok .value { color: #4caf50; }
         #alertBox { padding: 12px; border-radius: 8px; margin: 10px 0; font-weight: bold; font-size: 1em; transition: all 0.3s; }
         .safe { background: #0a3d0a; color: #4caf50; }
         .warning { background: #3d2a0a; color: #ff9800; }
@@ -30,9 +33,9 @@
         .spinner { width: 40px; height: 40px; border: 4px solid #333; border-top: 4px solid #00d4ff; border-radius: 50%; animation: spin 1s linear infinite; }
         @keyframes spin { 100% { transform: rotate(360deg); } }
         #fps { position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,0.6); padding: 3px 8px; border-radius: 4px; font-size: 0.75em; }
-        #history { max-height: 100px; overflow-y: auto; text-align: left; font-size: 0.8em; background: #16213e; padding: 8px; border-radius: 8px; margin-top: 10px; }
+        #history { max-height: 120px; overflow-y: auto; text-align: left; font-size: 0.75em; background: #16213e; padding: 8px; border-radius: 8px; margin-top: 10px; }
         #history div { padding: 2px 0; border-bottom: 1px solid #1a1a3e; }
-        #debug { font-size: 0.7em; color: #666; margin-top: 5px; }
+        .section-title { font-size: 0.7em; color: #00d4ff; margin: 8px 0 4px; text-transform: uppercase; letter-spacing: 1px; }
     </style>
 </head>
 <body>
@@ -56,6 +59,7 @@
         <button class="btn" onclick="resetAlerts()">Reset</button>
     </div>
 
+    <div class="section-title">Face Metrics</div>
     <div class="status">
         <div class="card"><div class="label">FACE</div><div class="value" id="faceVal">-</div></div>
         <div class="card"><div class="label">EAR</div><div class="value" id="earVal">-</div></div>
@@ -65,34 +69,75 @@
         <div class="card"><div class="label">PITCH</div><div class="value" id="pitchVal">-</div></div>
     </div>
 
+    <div class="section-title">Micro-Signs (Research-Based)</div>
+    <div class="status">
+        <div class="card"><div class="label">PERCLOS</div><div class="value" id="perclosVal">0%</div></div>
+        <div class="card"><div class="label">BLINK/ms</div><div class="value" id="blinkDurVal">-</div></div>
+        <div class="card"><div class="label">BLINK/min</div><div class="value" id="blinkRateVal">-</div></div>
+        <div class="card"><div class="label">MICROSLEEP</div><div class="value" id="microsleepVal">0</div></div>
+        <div class="card"><div class="label">GAZE_OFF</div><div class="value" id="gazeOffVal">0.0s</div></div>
+        <div class="card"><div class="label">NOD</div><div class="value" id="nodVal">0</div></div>
+    </div>
+
     <div id="alertBox" class="safe">SAFE - No alerts</div>
     <div id="history"></div>
-    <div id="debug"></div>
 
     <script type="module">
-        // ========== IMPORTS ==========
-        import { FaceLandmarker, FilesetResolver, DrawingUtils } from
+        import { FaceLandmarker, FilesetResolver } from
             "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs";
 
-        // ========== CONFIG ==========
+        // ==================== CONFIG ====================
         const EAR_THRESHOLD = 0.25;
-        const EAR_CONSEC = 20;
         const MAR_THRESHOLD = 0.60;
-        const MAR_CONSEC = 15;
         const YAW_THRESHOLD = 25;
         const PITCH_THRESHOLD = 20;
-        const POSE_CONSEC = 15;
 
-        // ========== STATE ==========
+        // PERCLOS: % eyes >80% closed in 60s window (NHTSA)
+        const PERCLOS_THRESHOLD = 0.10;
+        const PERCLOS_WINDOW = 60000;
+
+        // Microsleep: 0.5-3s eye closure (US Patent 12633141)
+        const MSLEEP_MIN = 500;
+        const MSLEEP_MAX = 3000;
+
+        // Slow eyelid closure >500ms (Caffier et al.)
+        const SLOW_BLINK_MS = 500;
+
+        // Gaze off-road >3s (EuroNCAP DMS)
+        const GAZE_OFF_THRESHOLD = 3000;
+
+        // Head nodding
+        const NOD_THRESHOLD = 18;
+
+        // ==================== STATE ====================
         let faceLandmarker = null;
         let streaming = false;
-        let earCnt = 0, marCnt = 0, yawCnt = 0, pitchCnt = 0;
         let frameIdx = 0;
         let baseYaw = 0, basePitch = 0, calibrated = false;
         let lastVideoTime = -1;
         let frameCount = 0, lastFpsTime = Date.now();
 
-        // One Euro Filter params
+        // Blink
+        let eyesClosed = false;
+        let blinkStart = 0;
+        let blinkDurations = [];
+        let blinkTimestamps = [];
+        let slowBlinkCount = 0;
+        let microsleepCount = 0;
+
+        // PERCLOS
+        let eyeClosureLog = [];
+
+        // Gaze deviation
+        let gazeOffStart = 0;
+        let gazeOffTotal = 0;
+
+        // Head nod
+        let lastPitch = 0;
+        let nodCount = 0;
+        let nodCooldown = false;
+
+        // One Euro
         let prevEAR = 0.3, prevMAR = 0.1, prevYaw = 0, prevPitch = 0;
         const beta = 0.7, alpha = 0.15;
 
@@ -107,12 +152,12 @@
         const overlay = document.getElementById('overlay');
         const ctx = overlay.getContext('2d');
 
-        // ========== LANDMARK INDICES (478-point) ==========
+        // 478-point indices
         const L_EYE = [33, 160, 158, 133, 153, 144];
         const R_EYE = [362, 385, 387, 263, 373, 380];
-        const MOUTH = [61, 13, 14, 87, 178, 88, 95, 78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95];
+        const MOUTH = [61, 13, 14, 87, 178, 88, 95, 78, 191, 80, 81, 82];
 
-        // ========== LOAD MODEL ==========
+        // ==================== LOAD MODEL ====================
         async function loadModel() {
             const vision = await FilesetResolver.forVisionTasks(
                 "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
@@ -133,7 +178,7 @@
             document.getElementById('loading').classList.add('hidden');
         }
 
-        // ========== GEOMETRY ==========
+        // ==================== GEOMETRY ====================
         function dist(a, b) {
             return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + ((a.z || 0) - (b.z || 0)) ** 2);
         }
@@ -147,16 +192,13 @@
 
         function calcMAR(mouth) {
             let total = 0;
-            for (let i = 0; i < mouth.length - 1; i++) {
-                total += dist(mouth[i], mouth[i + 1]);
-            }
+            for (let i = 0; i < mouth.length - 1; i++) total += dist(mouth[i], mouth[i + 1]);
             const h = dist(mouth[0], mouth[Math.floor(mouth.length / 2)]);
             return total / (mouth.length * h + 0.001);
         }
 
-        // ========== HEAD POSE FROM MATRIX ==========
+        // ==================== HEAD POSE ====================
         function matrixToEuler(m) {
-            // m is 4x4 flattened column-major
             const sy = Math.sqrt(m[0] * m[0] + m[1] * m[1]);
             const singular = sy < 1e-6;
             let yaw, pitch, roll;
@@ -169,39 +211,52 @@
                 pitch = Math.atan2(-m[9], sy);
                 roll = 0;
             }
-            return {
-                yaw: yaw * 180 / Math.PI,
-                pitch: pitch * 180 / Math.PI,
-                roll: roll * 180 / Math.PI
-            };
+            return { yaw: yaw * 180 / Math.PI, pitch: pitch * 180 / Math.PI, roll: roll * 180 / Math.PI };
         }
 
-        // ========== GAZE FROM LANDMARKS ==========
+        // ==================== GAZE ====================
         function getGaze(pts) {
             const lIn = pts[33], lOut = pts[133];
             const rIn = pts[362], rOut = pts[263];
-
-            // Approximate iris center from eye contour midpoints
             const lIris = { x: (pts[159].x + pts[145].x) / 2, y: (pts[159].y + pts[145].y) / 2 };
             const rIris = { x: (pts[386].x + pts[374].x) / 2, y: (pts[386].y + pts[374].y) / 2 };
-
             const lR = (lIris.x - lIn.x) / (lOut.x - lIn.x + 0.001);
             const rR = (rIris.x - rIn.x) / (rOut.x - rIn.x + 0.001);
             const avg = (lR + rR) / 2;
-
             if (avg < 0.35) return 'right';
             if (avg > 0.65) return 'left';
             return 'center';
         }
 
-        // ========== DETECTION LOOP ==========
+        // ==================== PERCLOS ====================
+        function updatePERCLOS(isClosed, now) {
+            eyeClosureLog.push({ closed: isClosed, time: now });
+            eyeClosureLog = eyeClosureLog.filter(e => now - e.time < PERCLOS_WINDOW);
+            if (eyeClosureLog.length === 0) return 0;
+            const closedTime = eyeClosureLog.filter(e => e.closed).reduce((s, e, i, a) => {
+                if (i === 0) return 0;
+                const dt = e.time - a[i - 1].time;
+                return s + (e.closed ? dt : 0);
+            }, 0);
+            const totalTime = now - eyeClosureLog[0].time;
+            return totalTime > 0 ? closedTime / totalTime : 0;
+        }
+
+        // ==================== BLINK RATE ====================
+        function getBlinkRate() {
+            const now = Date.now();
+            const recent = blinkTimestamps.filter(t => now - t < 60000);
+            return recent.length;
+        }
+
+        // ==================== DETECT ====================
         function detect() {
             if (!streaming) return;
 
             if (video.currentTime !== lastVideoTime && faceLandmarker) {
                 lastVideoTime = video.currentTime;
-
-                const results = faceLandmarker.detectForVideo(video, performance.now());
+                const now = performance.now();
+                const results = faceLandmarker.detectForVideo(video, now);
 
                 overlay.width = video.videoWidth;
                 overlay.height = video.videoHeight;
@@ -209,107 +264,160 @@
 
                 if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
                     calibrated = false;
+                    eyesClosed = false;
                     updateUI({ face: false, ear: 0, mar: 0, gaze: '-', yaw: 0, pitch: 0, alerts: ['NO_FACE'] });
                     requestAnimationFrame(detect);
                     return;
                 }
 
-                const landmarks = results.faceLandmarks[0];
-                const blendshapes = results.faceBlendshapes ? results.faceBlendshapes[0] : null;
-                const matrix = results.facialTransformationMatrixes ? results.facialTransformationMatrixes[0] : null;
+                const lm = results.faceLandmarks[0];
+                const bs = results.faceBlendshapes ? results.faceBlendshapes[0] : null;
+                const mat = results.facialTransformationMatrixes ? results.facialTransformationMatrixes[0] : null;
 
-                // Draw landmarks
+                // Draw
                 ctx.fillStyle = '#00ff00';
-                for (const p of landmarks) {
+                for (const p of lm) {
                     ctx.beginPath();
                     ctx.arc(p.x * overlay.width, p.y * overlay.height, 1.5, 0, Math.PI * 2);
                     ctx.fill();
                 }
 
-                // EAR from blendshapes (most accurate)
+                // EAR
                 let ear = 0.3;
-                if (blendshapes) {
-                    const lBlink = blendshapes.find(b => b.categoryName === 'eyeBlinkLeft');
-                    const rBlink = blendshapes.find(b => b.categoryName === 'eyeBlinkRight');
-                    const lOpen = lBlink ? 1 - lBlink.score : 0.5;
-                    const rOpen = rBlink ? 1 - rBlink.score : 0.5;
-                    ear = (lOpen + rOpen) / 2;
+                if (bs) {
+                    const lB = bs.find(b => b.categoryName === 'eyeBlinkLeft');
+                    const rB = bs.find(b => b.categoryName === 'eyeBlinkRight');
+                    ear = ((lB ? 1 - lB.score : 0.5) + (rB ? 1 - rB.score : 0.5)) / 2;
                 } else {
-                    ear = (calcEAR(L_EYE.map(i => landmarks[i])) + calcEAR(R_EYE.map(i => landmarks[i]))) / 2;
+                    ear = (calcEAR(L_EYE.map(i => lm[i])) + calcEAR(R_EYE.map(i => lm[i]))) / 2;
                 }
                 ear = oneEuro(prevEAR, ear);
                 prevEAR = ear;
 
-                // MAR from blendshapes
+                // MAR
                 let mar = 0;
-                if (blendshapes) {
-                    const jawOpen = blendshapes.find(b => b.categoryName === 'jawOpen');
-                    mar = jawOpen ? jawOpen.score : 0;
+                if (bs) {
+                    const jaw = bs.find(b => b.categoryName === 'jawOpen');
+                    mar = jaw ? jaw.score : 0;
                 } else {
-                    mar = calcMAR(MOUTH.slice(0, 12).map(i => landmarks[i]));
+                    mar = calcMAR(MOUTH.map(i => lm[i]));
                 }
                 mar = oneEuro(prevMAR, mar);
                 prevMAR = mar;
 
-                // Head pose from transformation matrix (most accurate)
+                // Head pose
                 let yaw = 0, pitch = 0;
-                if (matrix) {
-                    const euler = matrixToEuler(matrix);
-                    yaw = euler.yaw;
-                    pitch = euler.pitch;
+                if (mat) {
+                    const e = matrixToEuler(mat);
+                    yaw = e.yaw;
+                    pitch = e.pitch;
                 } else {
-                    // Fallback: geometric estimation
-                    const nose = landmarks[1];
-                    const lEye = landmarks[33];
-                    const rEye = landmarks[263];
-                    const forehead = landmarks[10];
-                    const chin = landmarks[152];
+                    const nose = lm[1], lEye = lm[33], rEye = lm[263], fore = lm[10], chin = lm[152];
                     const eyeCx = (lEye.x + rEye.x) / 2;
                     const eyeW = dist(lEye, rEye);
-                    const faceH = dist(forehead, chin);
-                    const faceMidY = (forehead.y + chin.y) / 2;
+                    const faceH = dist(fore, chin);
                     yaw = ((nose.x - eyeCx) / eyeW) * 50;
-                    pitch = ((nose.y - faceMidY) / (faceH * 0.5)) * 50;
+                    pitch = ((nose.y - (fore.y + chin.y) / 2) / (faceH * 0.5)) * 50;
                 }
                 yaw = oneEuro(prevYaw, yaw);
                 pitch = oneEuro(prevPitch, pitch);
                 prevYaw = yaw;
                 prevPitch = pitch;
 
-                // Calibration
+                // Calibrate
                 frameIdx++;
-                if (frameIdx <= 30) {
-                    baseYaw = yaw;
-                    basePitch = pitch;
-                    calibrated = false;
-                } else {
-                    calibrated = true;
-                }
+                if (frameIdx <= 30) { baseYaw = yaw; basePitch = pitch; calibrated = false; }
+                else calibrated = true;
 
                 const adjYaw = calibrated ? yaw - baseYaw : 0;
                 const adjPitch = calibrated ? pitch - basePitch : 0;
+                const gaze = calibrated ? getGaze(lm) : 'center';
 
-                // Gaze
-                const gaze = calibrated ? getGaze(landmarks) : 'center';
+                // ====== MICRO-SIGN DETECTION ======
 
-                // ===== ALERTS =====
+                // 1. Blink tracking
+                const isClosed = ear < EAR_THRESHOLD;
+                if (isClosed && !eyesClosed) {
+                    eyesClosed = true;
+                    blinkStart = now;
+                } else if (!isClosed && eyesClosed) {
+                    eyesClosed = false;
+                    const dur = now - blinkStart;
+                    blinkDurations.push(dur);
+                    if (blinkDurations.length > 100) blinkDurations.shift();
+                    blinkTimestamps.push(now);
+                    blinkTimestamps = blinkTimestamps.filter(t => now - t < 60000);
+                    lastBlinkEnd = now;
+
+                    // Slow eyelid closure >500ms
+                    if (dur > SLOW_BLINK_MS) slowBlinkCount++;
+
+                    // Microsleep 0.5-3s
+                    if (dur >= MSLEEP_MIN && dur <= MSLEEP_MAX) microsleepCount++;
+                }
+
+                const blinkDur = eyesClosed ? (now - blinkStart) : (blinkDurations.length > 0 ? blinkDurations[blinkDurations.length - 1] : 0);
+                const blinkRate = getBlinkRate();
+
+                // 2. PERCLOS
+                const perclos = updatePERCLOS(isClosed, now);
+
+                // 3. Gaze deviation
+                if (gaze !== 'center' && calibrated) {
+                    if (gazeOffStart === 0) gazeOffStart = now;
+                } else {
+                    gazeOffStart = 0;
+                }
+                const gazeOffDur = gazeOffStart > 0 ? (now - gazeOffStart) / 1000 : 0;
+
+                // 4. Head nodding
+                if (adjPitch > NOD_THRESHOLD && !nodCooldown) {
+                    nodCount++;
+                    nodCooldown = true;
+                    setTimeout(() => { nodCooldown = false; }, 2000);
+                }
+
+                // ====== ALERTS ======
                 const alerts = [];
 
-                if (ear < EAR_THRESHOLD) { earCnt++; if (earCnt >= EAR_CONSEC) alerts.push('DROWSY'); }
-                else earCnt = 0;
+                // Drowsy via PERCLOS (NHTSA standard)
+                if (perclos > PERCLOS_THRESHOLD) alerts.push('DROWSY (PERCLOS)');
 
-                if (mar > MAR_THRESHOLD) { marCnt++; if (marCnt >= MAR_CONSEC) alerts.push('YAWNING'); }
-                else marCnt = 0;
+                // Slow eyelid closure
+                if (blinkDur > SLOW_BLINK_MS) alerts.push('SLOW_BLINK');
 
-                if (Math.abs(adjYaw) > YAW_THRESHOLD) { yawCnt++; if (yawCnt >= POSE_CONSEC) alerts.push('LOOKING_SIDE'); }
-                else yawCnt = 0;
+                // Microsleep
+                if (blinkDur >= MSLEEP_MIN && blinkDur <= MSLEEP_MAX) alerts.push('MICROSLEEP');
 
-                if (adjPitch > PITCH_THRESHOLD) { pitchCnt++; if (pitchCnt >= POSE_CONSEC) alerts.push('LOOKING_DOWN'); }
-                else pitchCnt = 0;
+                // Prolonged eye closure >3s = sleep
+                if (blinkDur > 3000) alerts.push('EYES_CLOSED_3s+');
+
+                // Yawning
+                if (mar > MAR_THRESHOLD) alerts.push('YAWNING');
+
+                // Gaze off-road >3s (EuroNCAP)
+                if (gazeOffDur > GAZE_DEVIATION_THRESHOLD / 1000) alerts.push('GAZE_OFF_ROAD');
+
+                // Looking side
+                if (Math.abs(adjYaw) > YAW_THRESHOLD) alerts.push('LOOKING_SIDE');
+
+                // Head nodding
+                if (nodCount >= 3) alerts.push('HEAD_NODDING');
+
+                // Looking down
+                if (adjPitch > PITCH_THRESHOLD) alerts.push('LOOKING_DOWN');
+
+                // Abnormal blink rate (too few or too many)
+                if (blinkRate < 5 && calibrated && frameIdx > 60) alerts.push('LOW_BLINK_RATE');
+                if (blinkRate > 30) alerts.push('HIGH_BLINK_RATE');
 
                 updateUI({
                     face: true, ear: ear.toFixed(3), mar: mar.toFixed(3),
-                    gaze, yaw: adjYaw.toFixed(1), pitch: adjPitch.toFixed(1), alerts
+                    gaze, yaw: adjYaw.toFixed(1), pitch: adjPitch.toFixed(1),
+                    perclos: (perclos * 100).toFixed(1),
+                    blinkDur: Math.round(blinkDur),
+                    blinkRate, microsleepCount, gazeOffDur: gazeOffDur.toFixed(1),
+                    nodCount, alerts
                 });
 
                 // FPS
@@ -324,30 +432,50 @@
             requestAnimationFrame(detect);
         }
 
-        // ========== UI ==========
-        function updateUI(data) {
-            document.getElementById('faceVal').innerHTML = data.face ? '✅' : '❌';
-            document.getElementById('earVal').textContent = data.ear;
-            document.getElementById('marVal').textContent = data.mar;
-            document.getElementById('gazeVal').textContent = data.gaze;
-            document.getElementById('yawVal').textContent = data.yaw + '°';
-            document.getElementById('pitchVal').textContent = data.pitch + '°';
+        // ==================== UI ====================
+        function updateUI(d) {
+            document.getElementById('faceVal').innerHTML = d.face ? '✅' : '❌';
+            document.getElementById('earVal').textContent = d.ear;
+            document.getElementById('marVal').textContent = d.mar;
+            document.getElementById('gazeVal').textContent = d.gaze;
+            document.getElementById('yawVal').textContent = d.yaw + '°';
+            document.getElementById('pitchVal').textContent = d.pitch + '°';
 
+            // Micro-signs
+            const perclosEl = document.getElementById('perclosVal');
+            perclosEl.textContent = d.perclos + '%';
+            perclosEl.parentElement.className = 'card' + (d.perclos > 10 ? ' danger' : d.perclos > 5 ? ' warn' : ' ok');
+
+            const blinkDurEl = document.getElementById('blinkDurVal');
+            blinkDurEl.textContent = d.blinkDur + 'ms';
+            blinkDurEl.parentElement.className = 'card' + (d.blinkDur > 500 ? ' danger' : d.blinkDur > 300 ? ' warn' : ' ok');
+
+            document.getElementById('blinkRateVal').textContent = d.blinkRate + '/min';
+            document.getElementById('microsleepVal').textContent = d.microsleepCount;
+
+            const gazeOffEl = document.getElementById('gazeOffVal');
+            gazeOffEl.textContent = d.gazeOffDur + 's';
+            gazeOffEl.parentElement.className = 'card' + (d.gazeOffDur > 3 ? ' danger' : d.gazeOffDur > 1 ? ' warn' : ' ok');
+
+            document.getElementById('nodVal').textContent = d.nodCount;
+
+            // Alert box
             const box = document.getElementById('alertBox');
-            if (!data.alerts || data.alerts.length === 0) {
+            if (!d.alerts || d.alerts.length === 0) {
                 box.className = 'safe';
                 box.textContent = 'SAFE - No alerts';
             } else {
-                box.className = 'danger';
-                box.textContent = '⚠️ ' + data.alerts.join(' | ');
+                const hasDanger = d.alerts.some(a => a.includes('MICROSLEEP') || a.includes('EYES_CLOSED') || a.includes('PERCLOS'));
+                box.className = hasDanger ? 'danger' : 'warning';
+                box.textContent = '⚠️ ' + d.alerts.join(' | ');
                 const hist = document.getElementById('history');
                 const div = document.createElement('div');
-                div.textContent = new Date().toLocaleTimeString() + ' - ' + data.alerts.join(', ');
+                div.textContent = new Date().toLocaleTimeString() + ' - ' + d.alerts.join(', ');
                 hist.prepend(div);
             }
         }
 
-        // ========== CAMERA ==========
+        // ==================== CAMERA ====================
         async function startCamera() {
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({
@@ -357,9 +485,17 @@
                 streaming = true;
                 frameIdx = 0;
                 calibrated = false;
+                eyeClosureLog = [];
+                blinkDurations = [];
+                blinkTimestamps = [];
+                slowBlinkCount = 0;
+                microsleepCount = 0;
+                nodCount = 0;
+                gazeOffTotal = 0;
+                gazeOffStart = 0;
                 document.getElementById('startBtn').disabled = true;
                 document.getElementById('stopBtn').disabled = false;
-                video.onloadedmetadata = () => { detect(); };
+                video.onloadedmetadata = () => detect();
             } catch (err) {
                 alert('Camera error: ' + err.message);
             }
@@ -374,14 +510,20 @@
         }
 
         function resetAlerts() {
-            earCnt = marCnt = yawCnt = pitchCnt = 0;
             frameIdx = 0;
             calibrated = false;
+            eyeClosureLog = [];
+            blinkDurations = [];
+            blinkTimestamps = [];
+            slowBlinkCount = 0;
+            microsleepCount = 0;
+            nodCount = 0;
+            gazeOffTotal = 0;
+            gazeOffStart = 0;
             document.getElementById('alertBox').className = 'safe';
             document.getElementById('alertBox').textContent = 'SAFE - Alerts reset';
         }
 
-        // Expose to global for button onclick
         window.startCamera = startCamera;
         window.stopCamera = stopCamera;
         window.resetAlerts = resetAlerts;
