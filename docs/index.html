@@ -91,33 +91,26 @@
         const MAR_THRESHOLD = 0.60;
         const YAW_THRESHOLD = 25;
         const PITCH_THRESHOLD = 20;
-
-        // PERCLOS: % eyes >80% closed in 60s window (NHTSA)
         const PERCLOS_THRESHOLD = 0.10;
         const PERCLOS_WINDOW = 60000;
-
-        // Microsleep: 0.5-3s eye closure (US Patent 12633141)
         const MSLEEP_MIN = 500;
         const MSLEEP_MAX = 3000;
-
-        // Slow eyelid closure >500ms (Caffier et al.)
         const SLOW_BLINK_MS = 500;
-
-        // Gaze off-road >3s (EuroNCAP DMS)
         const GAZE_OFF_THRESHOLD = 3000;
-
-        // Head nodding
         const NOD_THRESHOLD = 18;
+        const MIN_DETECT_INTERVAL = 50;
 
         // ==================== STATE ====================
         let faceLandmarker = null;
         let streaming = false;
+        let detecting = false;
         let frameIdx = 0;
         let baseYaw = 0, basePitch = 0, calibrated = false;
         let lastVideoTime = -1;
+        let lastDetectTime = 0;
         let frameCount = 0, lastFpsTime = Date.now();
+        let consecutiveErrors = 0;
 
-        // Blink
         let eyesClosed = false;
         let blinkStart = 0;
         let blinkDurations = [];
@@ -125,19 +118,14 @@
         let slowBlinkCount = 0;
         let microsleepCount = 0;
 
-        // PERCLOS
-        let eyeClosureLog = [];
+        let eyeClosureSum = 0;
+        let eyeClosureWindowStart = 0;
+        let eyeClosureFrameCount = 0;
 
-        // Gaze deviation
         let gazeOffStart = 0;
-        let gazeOffTotal = 0;
-
-        // Head nod
-        let lastPitch = 0;
         let nodCount = 0;
         let nodCooldown = false;
 
-        // One Euro
         let prevEAR = 0.3, prevMAR = 0.1, prevYaw = 0, prevPitch = 0;
         const beta = 0.7, alpha = 0.15;
 
@@ -152,7 +140,6 @@
         const overlay = document.getElementById('overlay');
         const ctx = overlay.getContext('2d');
 
-        // 478-point indices
         const L_EYE = [33, 160, 158, 133, 153, 144];
         const R_EYE = [362, 385, 387, 263, 373, 380];
         const MOUTH = [61, 13, 14, 87, 178, 88, 95, 78, 191, 80, 81, 82];
@@ -228,284 +215,218 @@
             return 'center';
         }
 
-        // ==================== PERCLOS ====================
+        // ==================== EFFICIENT PERCLOS ====================
         function updatePERCLOS(isClosed, now) {
-            eyeClosureLog.push({ closed: isClosed, time: now });
-            eyeClosureLog = eyeClosureLog.filter(e => now - e.time < PERCLOS_WINDOW);
-            if (eyeClosureLog.length === 0) return 0;
-            const closedTime = eyeClosureLog.filter(e => e.closed).reduce((s, e, i, a) => {
-                if (i === 0) return 0;
-                const dt = e.time - a[i - 1].time;
-                return s + (e.closed ? dt : 0);
-            }, 0);
-            const totalTime = now - eyeClosureLog[0].time;
-            return totalTime > 0 ? closedTime / totalTime : 0;
+            if (eyeClosureWindowStart === 0) eyeClosureWindowStart = now;
+            eyeClosureFrameCount++;
+            if (isClosed) eyeClosureSum++;
+            if (now - eyeClosureWindowStart >= PERCLOS_WINDOW) {
+                eyeClosureSum = 0;
+                eyeClosureFrameCount = 0;
+                eyeClosureWindowStart = now;
+            }
+            return eyeClosureFrameCount > 0 ? eyeClosureSum / eyeClosureFrameCount : 0;
         }
 
         // ==================== BLINK RATE ====================
         function getBlinkRate() {
-            const now = Date.now();
-            const recent = blinkTimestamps.filter(t => now - t < 60000);
-            return recent.length;
+            const now = performance.now();
+            let count = 0;
+            for (let i = blinkTimestamps.length - 1; i >= 0; i--) {
+                if (now - blinkTimestamps[i] < 60000) count++;
+                else break;
+            }
+            return count;
         }
 
         // ==================== DETECT ====================
-        let detecting = false;
-
         function detect() {
             if (!streaming) return;
-
             if (detecting) { requestAnimationFrame(detect); return; }
 
-            if (video.currentTime !== lastVideoTime && faceLandmarker) {
-                detecting = true;
-                lastVideoTime = video.currentTime;
-                const now = performance.now();
+            const now = performance.now();
+            if (now - lastDetectTime < MIN_DETECT_INTERVAL) { requestAnimationFrame(detect); return; }
+            if (!faceLandmarker || video.currentTime === lastVideoTime) { requestAnimationFrame(detect); return; }
 
-                let results;
-                try {
-                    results = faceLandmarker.detectForVideo(video, now);
-                } catch (e) {
-                    detecting = false;
-                    console.warn('Detection error:', e);
-                    requestAnimationFrame(detect);
-                    return;
-                }
+            detecting = true;
+            lastDetectTime = now;
+            lastVideoTime = video.currentTime;
 
-                if (overlay.width !== video.videoWidth) overlay.width = video.videoWidth;
-                if (overlay.height !== video.videoHeight) overlay.height = video.videoHeight;
-                ctx.clearRect(0, 0, overlay.width, overlay.height);
+            let results;
+            try {
+                results = faceLandmarker.detectForVideo(video, now);
+                consecutiveErrors = 0;
+            } catch (e) {
+                consecutiveErrors++;
+                detecting = false;
+                if (consecutiveErrors > 5) lastVideoTime = -1;
+                requestAnimationFrame(detect);
+                return;
+            }
 
-                if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
-                    calibrated = false;
-                    eyesClosed = false;
-                    updateUI({ face: false, ear: 0, mar: 0, gaze: '-', yaw: 0, pitch: 0, alerts: ['NO_FACE'] });
-                    detecting = false;
-                    requestAnimationFrame(detect);
-                    return;
-                }
+            const w = overlay.width = video.videoWidth;
+            const h = overlay.height = video.videoHeight;
+            ctx.clearRect(0, 0, w, h);
 
-                const lm = results.faceLandmarks[0];
-                const bs = results.faceBlendshapes ? results.faceBlendshapes[0] : null;
-                const mat = results.facialTransformationMatrixes ? results.facialTransformationMatrixes[0] : null;
+            if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
+                calibrated = false;
+                eyesClosed = false;
+                updateUI({ face: false, ear: 0, mar: 0, gaze: '-', yaw: 0, pitch: 0, alerts: ['NO_FACE'] });
+                detecting = false;
+                requestAnimationFrame(detect);
+                return;
+            }
 
-                const w = overlay.width, h = overlay.height;
-                const now2 = performance.now();
+            const lm = results.faceLandmarks[0];
+            const bs = results.faceBlendshapes ? results.faceBlendshapes[0] : null;
+            const mat = results.facialTransformationMatrixes ? results.facialTransformationMatrixes[0] : null;
 
-                // Face bounding box
-                let minX = 1, maxX = 0, minY = 1, maxY = 0;
-                for (const p of lm) {
-                    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
-                    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
-                }
-                const pad = 0.08;
-                minX = Math.max(0, minX - pad); minY = Math.max(0, minY - pad);
-                maxX = Math.min(1, maxX + pad); maxY = Math.min(1, maxY + pad);
-                ctx.strokeStyle = 'rgba(0,212,255,0.4)';
-                ctx.lineWidth = 1;
-                ctx.strokeRect(minX * w, minY * h, (maxX - minX) * w, (maxY - minY) * h);
+            // Face bounding box
+            let minX = 1, maxX = 0, minY = 1, maxY = 0;
+            for (const p of lm) {
+                if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+                if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+            }
+            const pad = 0.08;
+            minX = Math.max(0, minX - pad); minY = Math.max(0, minY - pad);
+            maxX = Math.min(1, maxX + pad); maxY = Math.min(1, maxY + pad);
+            ctx.strokeStyle = 'rgba(0,212,255,0.4)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(minX * w, minY * h, (maxX - minX) * w, (maxY - minY) * h);
 
-                // 3D Axis from nose tip using transformation matrix
-                if (mat) {
-                    const noseX = lm[1].x * w, noseY = lm[1].y * h;
-                    const axisLen = 60;
+            // 3D Axis from nose tip
+            if (mat) {
+                const noseX = lm[1].x * w, noseY = lm[1].y * h;
+                const axisLen = 60;
+                const rx = [mat[0], mat[1], mat[2]];
+                const ry = [mat[4], mat[5], mat[6]];
+                const rz = [mat[8], mat[9], mat[10]];
 
-                    // Extract rotation columns from 4x4 matrix (column-major)
-                    // X-axis (red = right)
-                    const rx = [mat[0], mat[1], mat[2]];
-                    // Y-axis (green = down)
-                    const ry = [mat[4], mat[5], mat[6]];
-                    // Z-axis (blue = forward/look direction)
-                    const rz = [mat[8], mat[9], mat[10]];
+                ctx.lineWidth = 2.5;
+                ctx.font = 'bold 11px Arial';
 
-                    // Draw X axis (red)
-                    ctx.strokeStyle = '#f44336';
-                    ctx.lineWidth = 2.5;
-                    ctx.beginPath();
-                    ctx.moveTo(noseX, noseY);
-                    ctx.lineTo(noseX + rx[0] * axisLen, noseY + rx[1] * axisLen);
-                    ctx.stroke();
-                    ctx.fillStyle = '#f44336';
-                    ctx.font = 'bold 11px Arial';
-                    ctx.fillText('X', noseX + rx[0] * axisLen + 5, noseY + rx[1] * axisLen);
+                ctx.strokeStyle = '#f44336';
+                ctx.beginPath(); ctx.moveTo(noseX, noseY); ctx.lineTo(noseX + rx[0] * axisLen, noseY + rx[1] * axisLen); ctx.stroke();
+                ctx.fillStyle = '#f44336'; ctx.fillText('X', noseX + rx[0] * axisLen + 5, noseY + rx[1] * axisLen);
 
-                    // Draw Y axis (green)
-                    ctx.strokeStyle = '#4caf50';
-                    ctx.beginPath();
-                    ctx.moveTo(noseX, noseY);
-                    ctx.lineTo(noseX + ry[0] * axisLen, noseY + ry[1] * axisLen);
-                    ctx.stroke();
-                    ctx.fillStyle = '#4caf50';
-                    ctx.fillText('Y', noseX + ry[0] * axisLen + 5, noseY + ry[1] * axisLen);
+                ctx.strokeStyle = '#4caf50';
+                ctx.beginPath(); ctx.moveTo(noseX, noseY); ctx.lineTo(noseX + ry[0] * axisLen, noseY + ry[1] * axisLen); ctx.stroke();
+                ctx.fillStyle = '#4caf50'; ctx.fillText('Y', noseX + ry[0] * axisLen + 5, noseY + ry[1] * axisLen);
 
-                    // Draw Z axis (blue = gaze direction)
-                    ctx.strokeStyle = '#2196f3';
-                    ctx.lineWidth = 3;
-                    ctx.beginPath();
-                    ctx.moveTo(noseX, noseY);
-                    ctx.lineTo(noseX + rz[0] * axisLen, noseY + rz[1] * axisLen);
-                    ctx.stroke();
-                    // Arrowhead
-                    const arrowX = noseX + rz[0] * axisLen;
-                    const arrowY = noseY + rz[1] * axisLen;
-                    ctx.fillStyle = '#2196f3';
-                    ctx.beginPath();
-                    ctx.arc(arrowX, arrowY, 4, 0, Math.PI * 2);
-                    ctx.fill();
-                    ctx.fillText('Z (gaze)', arrowX + 6, arrowY);
+                ctx.strokeStyle = '#2196f3'; ctx.lineWidth = 3;
+                ctx.beginPath(); ctx.moveTo(noseX, noseY); ctx.lineTo(noseX + rz[0] * axisLen, noseY + rz[1] * axisLen); ctx.stroke();
+                ctx.fillStyle = '#2196f3'; ctx.beginPath(); ctx.arc(noseX + rz[0] * axisLen, noseY + rz[1] * axisLen, 4, 0, Math.PI * 2); ctx.fill();
+                ctx.fillText('Z (gaze)', noseX + rz[0] * axisLen + 6, noseY + rz[1] * axisLen);
 
-                    // Nose origin dot
-                    ctx.fillStyle = '#fff';
-                    ctx.beginPath();
-                    ctx.arc(noseX, noseY, 3, 0, Math.PI * 2);
-                    ctx.fill();
-                }
+                ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(noseX, noseY, 3, 0, Math.PI * 2); ctx.fill();
+            }
 
-                // EAR
-                let ear = 0.3;
-                if (bs) {
-                    const lB = bs.find(b => b.categoryName === 'eyeBlinkLeft');
-                    const rB = bs.find(b => b.categoryName === 'eyeBlinkRight');
-                    ear = ((lB ? 1 - lB.score : 0.5) + (rB ? 1 - rB.score : 0.5)) / 2;
-                } else {
-                    ear = (calcEAR(L_EYE.map(i => lm[i])) + calcEAR(R_EYE.map(i => lm[i]))) / 2;
-                }
-                ear = oneEuro(prevEAR, ear);
-                prevEAR = ear;
+            // EAR
+            let ear = 0.3;
+            if (bs) {
+                const lB = bs.find(b => b.categoryName === 'eyeBlinkLeft');
+                const rB = bs.find(b => b.categoryName === 'eyeBlinkRight');
+                ear = ((lB ? 1 - lB.score : 0.5) + (rB ? 1 - rB.score : 0.5)) / 2;
+            } else {
+                ear = (calcEAR(L_EYE.map(i => lm[i])) + calcEAR(R_EYE.map(i => lm[i]))) / 2;
+            }
+            ear = oneEuro(prevEAR, ear); prevEAR = ear;
 
-                // MAR
-                let mar = 0;
-                if (bs) {
-                    const jaw = bs.find(b => b.categoryName === 'jawOpen');
-                    mar = jaw ? jaw.score : 0;
-                } else {
-                    mar = calcMAR(MOUTH.map(i => lm[i]));
-                }
-                mar = oneEuro(prevMAR, mar);
-                prevMAR = mar;
+            // MAR
+            let mar = 0;
+            if (bs) {
+                const jaw = bs.find(b => b.categoryName === 'jawOpen');
+                mar = jaw ? jaw.score : 0;
+            } else {
+                mar = calcMAR(MOUTH.map(i => lm[i]));
+            }
+            mar = oneEuro(prevMAR, mar); prevMAR = mar;
 
-                // Head pose
-                let yaw = 0, pitch = 0;
-                if (mat) {
-                    const e = matrixToEuler(mat);
-                    yaw = e.yaw;
-                    pitch = e.pitch;
-                } else {
-                    const nose = lm[1], lEye = lm[33], rEye = lm[263], fore = lm[10], chin = lm[152];
-                    const eyeCx = (lEye.x + rEye.x) / 2;
-                    const eyeW = dist(lEye, rEye);
-                    const faceH = dist(fore, chin);
-                    yaw = ((nose.x - eyeCx) / eyeW) * 50;
-                    pitch = ((nose.y - (fore.y + chin.y) / 2) / (faceH * 0.5)) * 50;
-                }
-                yaw = oneEuro(prevYaw, yaw);
-                pitch = oneEuro(prevPitch, pitch);
-                prevYaw = yaw;
-                prevPitch = pitch;
+            // Head pose
+            let yaw = 0, pitch = 0;
+            if (mat) {
+                const e = matrixToEuler(mat);
+                yaw = e.yaw; pitch = e.pitch;
+            } else {
+                const nose = lm[1], lEye = lm[33], rEye = lm[263], fore = lm[10], chin = lm[152];
+                const eyeCx = (lEye.x + rEye.x) / 2;
+                const eyeW = dist(lEye, rEye);
+                const faceH = dist(fore, chin);
+                yaw = ((nose.x - eyeCx) / eyeW) * 50;
+                pitch = ((nose.y - (fore.y + chin.y) / 2) / (faceH * 0.5)) * 50;
+            }
+            yaw = oneEuro(prevYaw, yaw); pitch = oneEuro(prevPitch, pitch);
+            prevYaw = yaw; prevPitch = pitch;
 
-                // Calibrate
-                frameIdx++;
-                if (frameIdx <= 30) { baseYaw = yaw; basePitch = pitch; calibrated = false; }
-                else calibrated = true;
+            frameIdx++;
+            if (frameIdx <= 30) { baseYaw = yaw; basePitch = pitch; calibrated = false; }
+            else calibrated = true;
 
-                const adjYaw = calibrated ? yaw - baseYaw : 0;
-                const adjPitch = calibrated ? pitch - basePitch : 0;
-                const gaze = calibrated ? getGaze(lm) : 'center';
+            const adjYaw = calibrated ? yaw - baseYaw : 0;
+            const adjPitch = calibrated ? pitch - basePitch : 0;
+            const gaze = calibrated ? getGaze(lm) : 'center';
 
-                // ====== MICRO-SIGN DETECTION ======
+            // Blink tracking
+            const isClosed = ear < EAR_THRESHOLD;
+            if (isClosed && !eyesClosed) {
+                eyesClosed = true;
+                blinkStart = now;
+            } else if (!isClosed && eyesClosed) {
+                eyesClosed = false;
+                const dur = now - blinkStart;
+                blinkDurations.push(dur);
+                if (blinkDurations.length > 60) blinkDurations.shift();
+                blinkTimestamps.push(now);
+                if (blinkTimestamps.length > 60) blinkTimestamps.shift();
+                if (dur > SLOW_BLINK_MS) slowBlinkCount++;
+                if (dur >= MSLEEP_MIN && dur <= MSLEEP_MAX) microsleepCount++;
+            }
 
-                // 1. Blink tracking
-                const isClosed = ear < EAR_THRESHOLD;
-                if (isClosed && !eyesClosed) {
-                    eyesClosed = true;
-                    blinkStart = now;
-                } else if (!isClosed && eyesClosed) {
-                    eyesClosed = false;
-                    const dur = now - blinkStart;
-                    blinkDurations.push(dur);
-                    if (blinkDurations.length > 100) blinkDurations.shift();
-                    blinkTimestamps.push(now);
-                    blinkTimestamps = blinkTimestamps.filter(t => now - t < 60000);
-                    lastBlinkEnd = now;
+            const blinkDur = eyesClosed ? (now - blinkStart) : (blinkDurations.length > 0 ? blinkDurations[blinkDurations.length - 1] : 0);
+            const blinkRate = getBlinkRate();
+            const perclos = updatePERCLOS(isClosed, now);
 
-                    // Slow eyelid closure >500ms
-                    if (dur > SLOW_BLINK_MS) slowBlinkCount++;
+            if (gaze !== 'center' && calibrated) {
+                if (gazeOffStart === 0) gazeOffStart = now;
+            } else {
+                gazeOffStart = 0;
+            }
+            const gazeOffDur = gazeOffStart > 0 ? (now - gazeOffStart) / 1000 : 0;
 
-                    // Microsleep 0.5-3s
-                    if (dur >= MSLEEP_MIN && dur <= MSLEEP_MAX) microsleepCount++;
-                }
+            if (adjPitch > NOD_THRESHOLD && !nodCooldown) {
+                nodCount++;
+                nodCooldown = true;
+                setTimeout(() => { nodCooldown = false; }, 2000);
+            }
 
-                const blinkDur = eyesClosed ? (now - blinkStart) : (blinkDurations.length > 0 ? blinkDurations[blinkDurations.length - 1] : 0);
-                const blinkRate = getBlinkRate();
+            // Alerts
+            const alerts = [];
+            if (perclos > PERCLOS_THRESHOLD) alerts.push('DROWSY (PERCLOS)');
+            if (blinkDur > SLOW_BLINK_MS) alerts.push('SLOW_BLINK');
+            if (blinkDur >= MSLEEP_MIN && blinkDur <= MSLEEP_MAX) alerts.push('MICROSLEEP');
+            if (blinkDur > 3000) alerts.push('EYES_CLOSED_3s+');
+            if (mar > MAR_THRESHOLD) alerts.push('YAWNING');
+            if (gazeOffDur > GAZE_OFF_THRESHOLD / 1000) alerts.push('GAZE_OFF_ROAD');
+            if (Math.abs(adjYaw) > YAW_THRESHOLD) alerts.push('LOOKING_SIDE');
+            if (nodCount >= 3) alerts.push('HEAD_NODDING');
+            if (adjPitch > PITCH_THRESHOLD) alerts.push('LOOKING_DOWN');
+            if (blinkRate < 5 && calibrated && frameIdx > 60) alerts.push('LOW_BLINK_RATE');
+            if (blinkRate > 30) alerts.push('HIGH_BLINK_RATE');
 
-                // 2. PERCLOS
-                const perclos = updatePERCLOS(isClosed, now);
+            updateUI({
+                face: true, ear: ear.toFixed(3), mar: mar.toFixed(3),
+                gaze, yaw: adjYaw.toFixed(1), pitch: adjPitch.toFixed(1),
+                perclos: (perclos * 100).toFixed(1),
+                blinkDur: Math.round(blinkDur),
+                blinkRate, microsleepCount, gazeOffDur: gazeOffDur.toFixed(1),
+                nodCount, alerts
+            });
 
-                // 3. Gaze deviation
-                if (gaze !== 'center' && calibrated) {
-                    if (gazeOffStart === 0) gazeOffStart = now;
-                } else {
-                    gazeOffStart = 0;
-                }
-                const gazeOffDur = gazeOffStart > 0 ? (now - gazeOffStart) / 1000 : 0;
-
-                // 4. Head nodding
-                if (adjPitch > NOD_THRESHOLD && !nodCooldown) {
-                    nodCount++;
-                    nodCooldown = true;
-                    setTimeout(() => { nodCooldown = false; }, 2000);
-                }
-
-                // ====== ALERTS ======
-                const alerts = [];
-
-                // Drowsy via PERCLOS (NHTSA standard)
-                if (perclos > PERCLOS_THRESHOLD) alerts.push('DROWSY (PERCLOS)');
-
-                // Slow eyelid closure
-                if (blinkDur > SLOW_BLINK_MS) alerts.push('SLOW_BLINK');
-
-                // Microsleep
-                if (blinkDur >= MSLEEP_MIN && blinkDur <= MSLEEP_MAX) alerts.push('MICROSLEEP');
-
-                // Prolonged eye closure >3s = sleep
-                if (blinkDur > 3000) alerts.push('EYES_CLOSED_3s+');
-
-                // Yawning
-                if (mar > MAR_THRESHOLD) alerts.push('YAWNING');
-
-                // Gaze off-road >3s (EuroNCAP)
-                if (gazeOffDur > GAZE_DEVIATION_THRESHOLD / 1000) alerts.push('GAZE_OFF_ROAD');
-
-                // Looking side
-                if (Math.abs(adjYaw) > YAW_THRESHOLD) alerts.push('LOOKING_SIDE');
-
-                // Head nodding
-                if (nodCount >= 3) alerts.push('HEAD_NODDING');
-
-                // Looking down
-                if (adjPitch > PITCH_THRESHOLD) alerts.push('LOOKING_DOWN');
-
-                // Abnormal blink rate (too few or too many)
-                if (blinkRate < 5 && calibrated && frameIdx > 60) alerts.push('LOW_BLINK_RATE');
-                if (blinkRate > 30) alerts.push('HIGH_BLINK_RATE');
-
-                updateUI({
-                    face: true, ear: ear.toFixed(3), mar: mar.toFixed(3),
-                    gaze, yaw: adjYaw.toFixed(1), pitch: adjPitch.toFixed(1),
-                    perclos: (perclos * 100).toFixed(1),
-                    blinkDur: Math.round(blinkDur),
-                    blinkRate, microsleepCount, gazeOffDur: gazeOffDur.toFixed(1),
-                    nodCount, alerts
-                });
-
-                // FPS
-                frameCount++;
-                if (Date.now() - lastFpsTime >= 1000) {
-                    document.getElementById('fps').textContent = 'FPS: ' + frameCount;
-                    frameCount = 0;
-                    lastFpsTime = Date.now();
-                }
+            frameCount++;
+            if (Date.now() - lastFpsTime >= 1000) {
+                document.getElementById('fps').textContent = 'FPS: ' + frameCount;
+                frameCount = 0;
+                lastFpsTime = Date.now();
             }
 
             detecting = false;
@@ -521,7 +442,6 @@
             document.getElementById('yawVal').textContent = d.yaw + '°';
             document.getElementById('pitchVal').textContent = d.pitch + '°';
 
-            // Micro-signs
             const perclosEl = document.getElementById('perclosVal');
             perclosEl.textContent = d.perclos + '%';
             perclosEl.parentElement.className = 'card' + (d.perclos > 10 ? ' danger' : d.perclos > 5 ? ' warn' : ' ok');
@@ -539,7 +459,6 @@
 
             document.getElementById('nodVal').textContent = d.nodCount;
 
-            // Alert box
             const box = document.getElementById('alertBox');
             if (!d.alerts || d.alerts.length === 0) {
                 box.className = 'safe';
@@ -565,13 +484,17 @@
                 streaming = true;
                 frameIdx = 0;
                 calibrated = false;
-                eyeClosureLog = [];
+                lastVideoTime = -1;
+                lastDetectTime = 0;
+                consecutiveErrors = 0;
+                eyeClosureSum = 0;
+                eyeClosureWindowStart = 0;
+                eyeClosureFrameCount = 0;
                 blinkDurations = [];
                 blinkTimestamps = [];
                 slowBlinkCount = 0;
                 microsleepCount = 0;
                 nodCount = 0;
-                gazeOffTotal = 0;
                 gazeOffStart = 0;
                 document.getElementById('startBtn').disabled = true;
                 document.getElementById('stopBtn').disabled = false;
@@ -592,13 +515,15 @@
         function resetAlerts() {
             frameIdx = 0;
             calibrated = false;
-            eyeClosureLog = [];
+            lastVideoTime = -1;
+            eyeClosureSum = 0;
+            eyeClosureWindowStart = 0;
+            eyeClosureFrameCount = 0;
             blinkDurations = [];
             blinkTimestamps = [];
             slowBlinkCount = 0;
             microsleepCount = 0;
             nodCount = 0;
-            gazeOffTotal = 0;
             gazeOffStart = 0;
             document.getElementById('alertBox').className = 'safe';
             document.getElementById('alertBox').textContent = 'SAFE - Alerts reset';
