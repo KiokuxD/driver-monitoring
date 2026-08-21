@@ -88,18 +88,13 @@
             "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs";
 
         // ==================== CONFIG ====================
-        const EAR_THRESHOLD = 0.18;
+        const EAR_THRESHOLD = 0.25;  // From research: ear_blink.py
+        const EAR_CONSEC_FRAMES = 3; // Consecutive frames to confirm blink
         const MAR_THRESHOLD = 0.60;
-        const YAW_THRESHOLD = 25;
-        const PITCH_THRESHOLD = 20;
-        const PERCLOS_THRESHOLD = 0.10;
-        const PERCLOS_WINDOW = 60000;
-        const MSLEEP_MIN = 500;
-        const MSLEEP_MAX = 3000;
-        const SLOW_BLINK_MS = 500;
+        const YAW_THRESHOLD = 30;   // From head_distraction.py
+        const PITCH_THRESHOLD = 25; // From head_distraction.py
         const GAZE_OFF_THRESHOLD = 3000;
         const NOD_THRESHOLD = 18;
-        const MIN_DETECT_INTERVAL = 100;
 
         // ==================== STATE ====================
         let faceLandmarker = null;
@@ -117,6 +112,8 @@
         let blinkTimestamps = [];
         let slowBlinkCount = 0;
         let microsleepCount = 0;
+        let blinkConsecCounter = 0; // Consecutive frames with EAR < threshold
+        let blinkCount = 0; // Total blinks detected
 
         let eyeClosureSum = 0;
         let eyeClosureWindowStart = 0;
@@ -159,12 +156,14 @@
         });
 
         // MediaPipe 478-point canonical landmark indices
-        // EAR: 6 key points per eye
-        const L_EYE = [33, 160, 158, 133, 153, 144];
-        const R_EYE = [362, 385, 387, 263, 373, 380];
-        // Eye contour for overlay: just use the 6 EAR points + iris center
-        const L_EYE_CONTOUR = [33, 160, 158, 133, 153, 144];
-        const R_EYE_CONTOUR = [362, 385, 387, 263, 373, 380];
+        // EAR: 6 key points per eye (from research: ear_blink.py)
+        // Left eye:  p1=263(outer), p2=386(upper), p3=385(upper), p4=362(inner), p5=374(lower), p6=373(lower)
+        // Right eye: p1=33(outer),  p2=159(upper), p3=160(upper), p4=133(inner), p5=145(lower), p6=153(lower)
+        const L_EYE = [263, 386, 385, 362, 374, 373];
+        const R_EYE = [33, 159, 160, 133, 145, 153];
+        // Eye contour for overlay: outer → upper → inner → lower → outer
+        const L_EYE_CONTOUR = [263, 386, 385, 362, 374, 373];
+        const R_EYE_CONTOUR = [33, 159, 160, 133, 145, 153];
         const L_IRIS = [468, 469, 470, 471, 472];
         const R_IRIS = [473, 474, 475, 476, 477];
         const MOUTH = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
@@ -328,17 +327,29 @@
 
         // Gaze is now handled by estimateGaze() above (Algorithm 1: Gaze Ratio)
 
-        // ==================== EFFICIENT PERCLOS ====================
-        function updatePERCLOS(isClosed, now) {
-            if (eyeClosureWindowStart === 0) eyeClosureWindowStart = now;
-            eyeClosureFrameCount++;
-            if (isClosed) eyeClosureSum++;
-            if (now - eyeClosureWindowStart >= PERCLOS_WINDOW) {
-                eyeClosureSum = 0;
-                eyeClosureFrameCount = 0;
-                eyeClosureWindowStart = now;
+        // ==================== EFFICIENT PERCLOS (Research: perclose.py) ====================
+        // PERCLOS P80 = (frames where EAR < threshold) / total frames * 100
+        // Sliding window: 60 seconds * 30 fps = 1800 frames max
+        const PERCLOS_WINDOW_SEC = 60;
+        const PERCLOS_FPS = 30;
+        const PERCLOS_MAX_FRAMES = PERCLOS_WINDOW_SEC * PERCLOS_FPS;
+        let percloseFrames = []; // EAR values in sliding window
+
+        function updatePERCLOS(earValue) {
+            percloseFrames.push(earValue);
+            if (percloseFrames.length > PERCLOS_MAX_FRAMES) {
+                percloseFrames = percloseFrames.slice(-PERCLOS_MAX_FRAMES);
             }
-            return eyeClosureFrameCount > 0 ? eyeClosureSum / eyeClosureFrameCount : 0;
+            if (percloseFrames.length === 0) return 0;
+            const closedCount = percloseFrames.filter(e => e < EAR_THRESHOLD).length;
+            return (closedCount / percloseFrames.length) * 100;
+        }
+
+        function getPERCLOSState(perclos) {
+            if (perclos > 20) return 'DANGER';
+            if (perclos > 15) return 'DROWSY';
+            if (perclos >= 7.5) return 'QUESTIONABLE';
+            return 'AWAKE';
         }
 
         // ==================== BLINK RATE ====================
@@ -535,25 +546,32 @@
             // ---- Gaze (Algorithm 1: Gaze Ratio) ----
             const gazeResult = calibrated ? estimateGaze(lm) : { direction: 'center', confidence: 0 };
 
-            // ---- Blink tracking ----
+            // ---- Blink tracking (Research: ear_blink.py) ----
             const isClosed = ear < EAR_THRESHOLD;
-            if (isClosed && !eyesClosed) {
-                eyesClosed = true;
-                blinkStart = now;
-            } else if (!isClosed && eyesClosed) {
-                eyesClosed = false;
-                const dur = now - blinkStart;
-                blinkDurations.push(dur);
-                if (blinkDurations.length > 60) blinkDurations.shift();
-                blinkTimestamps.push(now);
-                if (blinkTimestamps.length > 60) blinkTimestamps.shift();
-                if (dur > SLOW_BLINK_MS) slowBlinkCount++;
-                if (dur >= MSLEEP_MIN && dur <= MSLEEP_MAX) microsleepCount++;
+            let blinkDetected = false;
+
+            if (isClosed) {
+                blinkConsecCounter++;
+            } else {
+                // Eye just opened — check if we had a confirmed blink
+                if (blinkConsecCounter >= EAR_CONSEC_FRAMES) {
+                    blinkDetected = true;
+                    blinkCount++;
+                    const dur = blinkConsecCounter * (1000 / 30); // approximate ms
+                    blinkDurations.push(dur);
+                    if (blinkDurations.length > 60) blinkDurations.shift();
+                    blinkTimestamps.push(now);
+                    if (blinkTimestamps.length > 60) blinkTimestamps.shift();
+                    if (dur > 800) slowBlinkCount++;
+                    if (dur >= 1500 && dur <= 3000) microsleepCount++;
+                }
+                blinkConsecCounter = 0;
             }
 
-            const blinkDur = eyesClosed ? (now - blinkStart) : 0;
+            const blinkDur = isClosed ? blinkConsecCounter * (1000 / 30) : 0;
             const blinkRate = getBlinkRate();
-            const perclos = updatePERCLOS(isClosed, now);
+            const perclos = updatePERCLOS(ear);
+            const percloseState = getPERCLOSState(perclos);
 
             // Debug: log eye landmark positions
             if (frameIdx % 120 === 0) {
@@ -577,17 +595,27 @@
                 setTimeout(() => { nodCooldown = false; }, 2000);
             }
 
-            // ---- Alerts ----
+            // ---- Alerts (Research-based thresholds) ----
             const alerts = [];
-            if (perclos > PERCLOS_THRESHOLD) alerts.push('DROWSY');
-            if (blinkDur > SLOW_BLINK_MS) alerts.push('SLOW_BLINK');
-            if (blinkDur >= MSLEEP_MIN && blinkDur <= MSLEEP_MAX) alerts.push('MICROSLEEP');
+            // PERCLOS: >20% DANGER, >15% DROWSY (from perclose.py)
+            if (percloseState === 'DANGER') alerts.push('DANGER');
+            else if (percloseState === 'DROWSY') alerts.push('DROWSY');
+            // Slow blink: >800ms (from ear_blink.py consec_frames=3)
+            if (blinkDur > 800) alerts.push('SLOW_BLINK');
+            // Microsleep: 1500-3000ms (from head_distraction.py)
+            if (blinkDur >= 1500 && blinkDur <= 3000) alerts.push('MICROSLEEP');
             if (blinkDur > 3000) alerts.push('EYES_CLOSED');
+            // Yawn
             if (mar > MAR_THRESHOLD) alerts.push('YAWNING');
-            if (gazeOffDur > GAZE_OFF_THRESHOLD / 1000) alerts.push('GAZE_OFF');
-            if (Math.abs(adjYaw) > YAW_THRESHOLD) alerts.push('LOOKING_SIDE');
+            // Gaze off road
+            if (gazeOffDur > 3) alerts.push('GAZE_OFF');
+            // Head distraction: yaw>30 or pitch>25 (from head_distraction.py)
+            if (Math.abs(adjYaw) > 30) alerts.push('HEAD_TURN');
+            if (adjPitch > 25) alerts.push('HEAD_DOWN');
+            if (adjPitch < -20) alerts.push('HEAD_UP');
+            // Head nodding
             if (nodCount >= 3) alerts.push('HEAD_NOD');
-            if (adjPitch > PITCH_THRESHOLD) alerts.push('LOOKING_DOWN');
+            // Blink rate
             if (blinkRate < 5 && calibrated && frameIdx > 60) alerts.push('LOW_BLINK');
             if (blinkRate > 30) alerts.push('HIGH_BLINK');
 
@@ -595,10 +623,10 @@
                 face: true, ear: ear.toFixed(3), mar: mar.toFixed(3),
                 gaze: gazeResult.direction, gazeConf: gazeResult.confidence,
                 yaw: adjYaw.toFixed(1), pitch: adjPitch.toFixed(1),
-                perclos: (perclos * 100).toFixed(1),
+                perclos: perclos.toFixed(1),
                 blinkDur: Math.round(blinkDur),
                 blinkRate, microsleepCount, gazeOffDur: gazeOffDur.toFixed(1),
-                nodCount, alerts
+                nodCount, alerts, blinkCount
             });
 
             frameCount++;
@@ -623,7 +651,7 @@
 
             const perclosEl = document.getElementById('perclosVal');
             perclosEl.textContent = d.perclos + '%';
-            perclosEl.parentElement.className = 'card' + (d.perclos > 10 ? ' danger' : d.perclos > 5 ? ' warn' : ' ok');
+            perclosEl.parentElement.className = 'card' + (d.perclos > 20 ? ' danger' : d.perclos > 15 ? ' warn' : ' ok');
 
             const blinkDurEl = document.getElementById('blinkDurVal');
             blinkDurEl.textContent = d.blinkDur + 'ms';
@@ -702,8 +730,11 @@
             blinkTimestamps = [];
             slowBlinkCount = 0;
             microsleepCount = 0;
+            blinkConsecCounter = 0;
+            blinkCount = 0;
             nodCount = 0;
             gazeOffStart = 0;
+            percloseFrames = [];
             document.getElementById('alertBox').className = 'safe';
             document.getElementById('alertBox').textContent = 'SAFE - Alerts reset';
         }
