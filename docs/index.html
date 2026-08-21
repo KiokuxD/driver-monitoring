@@ -78,7 +78,7 @@
         const MAR_THRESHOLD = 0.60;
         const MAR_CONSEC_FRAMES = 15;
         const YAW_THRESHOLD = 30;
-        const PITCH_THRESHOLD = 25;
+        const PITCH_THRESHOLD = 35;
 
         // ========== STATE ==========
         let earCounter = 0;
@@ -129,47 +129,35 @@
         const MOUTH = [60, 61, 62, 63, 64, 65, 66, 67];
 
         // ========== HEAD POSE ESTIMATION ==========
-        function estimateHeadPose(landmarks, imgW, imgH) {
+        function estimateHeadPose(landmarks) {
             const pts = landmarks.positions;
-            // 3D model points
-            const modelPoints = [
-                [0, 0, 0],           // Nose tip (30)
-                [0, -330, -65],      // Chin (8)
-                [-225, 170, -135],   // Left eye left corner (36)
-                [225, 170, -135],    // Right eye right corner (45)
-                [-150, -150, -125],  // Left Mouth corner (48)
-                [150, -150, -125]    // Right mouth corner (54)
-            ];
 
-            const imagePoints = [
-                pts[30], pts[8], pts[36], pts[45], pts[48], pts[54]
-            ].map(p => [p.x * imgW / overlay.width, p.y * imgH / overlay.height]);
+            const nose = pts[30];       // Nose tip
+            const leftEye = pts[36];    // Left eye corner
+            const rightEye = pts[45];   // Right eye corner
+            const forehead = pts[27];   // Nose bridge top (between eyebrows)
+            const chin = pts[8];        // Chin
 
-            // Solve PnP approximation
-            const cx = imgW / 2;
-            const cy = imgH / 2;
-            const focal = imgW;
+            const eyeCenter = {
+                x: (leftEye.x + rightEye.x) / 2,
+                y: (leftEye.y + rightEye.y) / 2
+            };
 
-            const rows = 3, cols = 3;
-            const cameraMatrix = [focal, 0, cx, 0, focal, cy, 0, 0, 1];
+            const eyeWidth = distance(leftEye, rightEye);
+            const faceHeight = distance(forehead, chin);
 
-            // Simple head pose from landmarks
-            const nose = pts[30];
-            const leftEye = pts[36];
-            const rightEye = pts[45];
-            const chin = pts[8];
+            // Yaw (left-right turn): nose horizontal offset from eye center
+            const yaw = Math.atan2(nose.x - eyeCenter.x, eyeWidth) * (180 / Math.PI);
 
-            // Yaw (left-right)
-            const eyeCenter = { x: (leftEye.x + rightEye.x) / 2, y: (leftEye.y + rightEye.y) / 2 };
-            const yaw = Math.atan2(nose.x - eyeCenter.x, 50) * (180 / Math.PI);
+            // Pitch (up-down): nose vertical position relative to face midpoint
+            const faceMidY = (forehead.y + chin.y) / 2;
+            const noseOffset = nose.y - faceMidY;
+            const pitch = (noseOffset / (faceHeight / 2)) * 45;
 
-            // Pitch (up-down)
-            const pitch = Math.atan2(chin.y - eyeCenter.y, 80) * (180 / Math.PI) - 10;
-
-            // Roll
+            // Roll (tilt)
             const roll = Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x) * (180 / Math.PI);
 
-            return { yaw: -yaw, pitch, roll };
+            return { yaw, pitch, roll };
         }
 
         // ========== GAZE ESTIMATION ==========
@@ -246,7 +234,7 @@
 
             const mar = calcMAR(mouthPts);
 
-            const headPose = estimateHeadPose(landmarks, video.videoWidth, video.videoHeight);
+            const headPose = estimateHeadPose(landmarks);
             const gaze = estimateGaze(landmarks);
 
             // Alerts
