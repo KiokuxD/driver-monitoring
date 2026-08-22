@@ -156,14 +156,16 @@
         });
 
         // MediaPipe 478-point canonical landmark indices
-        // From face_mesh_extractor.py research code:
+        // From face_mesh_extractor.py research code (EAR indices):
         // Left eye:  [outer(362), top(385), top(387), inner(263), bottom(373), bottom(380)]
         // Right eye: [outer(33), top(160), top(158), inner(133), bottom(153), bottom(144)]
         const L_EYE = [362, 385, 387, 263, 373, 380];
         const R_EYE = [33, 160, 158, 133, 153, 144];
         // Eye contour for overlay: outer → top → inner → bottom → outer
-        const L_EYE_CONTOUR = [362, 385, 387, 263, 373, 380];
-        const R_EYE_CONTOUR = [33, 160, 158, 133, 153, 144];
+        // Full eye contour for overlay (MediaPipe face_mesh_connections.py)
+        // FACEMESH_LEFT_EYE ordered: lower→inner→upper→outer→close
+        const L_EYE_CONTOUR = [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466];
+        const R_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246];
         const L_IRIS = [468, 469, 470, 471, 472];
         const R_IRIS = [473, 474, 475, 476, 477];
         const MOUTH = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
@@ -306,11 +308,11 @@
 
         // ==================== HEAD POSE ====================
         function matrixToEuler(m) {
-            // m is a flat 16-element Float32Array (ROW-major 4x4 matrix)
-            // Access as m[row*4 + col]
-            const r00 = m[0], r01 = m[1], r02 = m[2];
-            const r10 = m[4], r11 = m[5], r12 = m[6];
-            const r20 = m[8], r21 = m[9], r22 = m[10];
+            // m is a flat 16-element Float32Array (COLUMN-major 4x4 matrix)
+            // Access as m[col*4 + row]
+            const r00 = m[0], r01 = m[4], r02 = m[8];
+            const r10 = m[1], r11 = m[5], r12 = m[9];
+            const r20 = m[2], r21 = m[6], r22 = m[10];
 
             let yaw, pitch, roll;
             if (Math.abs(r20) > 0.999) {
@@ -454,10 +456,10 @@
             if (mat) {
                 const noseX = lm[1].x * w, noseY = lm[1].y * h;
                 const axisLen = 60;
-                // mat is flat ROW-major: mat[row*4 + col]
-                const rx = [mat[0], mat[4]]; // X axis (first row → screen x,y)
-                const ry = [mat[1], mat[5]]; // Y axis (second row)
-                const rz = [mat[2], mat[6]]; // Z axis (third row)
+                // mat is flat COLUMN-major: mat[col*4 + row]
+                const rx = [mat[0], mat[1]]; // X axis (first column → screen x,y)
+                const ry = [mat[4], mat[5]]; // Y axis (second column)
+                const rz = [mat[8], mat[9]]; // Z axis (third column)
                 ctx.lineWidth = 2.5;
                 ctx.font = 'bold 11px Arial';
 
@@ -579,7 +581,7 @@
                 log(`EYE L: ${L_EYE_CONTOUR.map(valid).join(' ')}`);
                 log(`EYE R: ${R_EYE_CONTOUR.map(valid).join(' ')}`);
                 const matOk = mat && mat[0] != null && mat[1] != null && mat[2] != null;
-                log(`MAT: ${matOk ? `[${mat[0].toFixed(2)},${mat[1].toFixed(2)},${mat[2].toFixed(2)}]...yaw=${yaw.toFixed(1)} pitch=${pitch.toFixed(1)}` : 'null'}`);
+                log(`MAT: ${matOk ? `[${mat[0].toFixed(2)},${mat[4].toFixed(2)},${mat[8].toFixed(2)}] (col0) yaw=${yaw.toFixed(1)} pitch=${pitch.toFixed(1)}` : 'null'}`);
             }
 
             if (gazeResult.direction !== 'center' && calibrated) {
