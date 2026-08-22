@@ -1559,6 +1559,10 @@ function computeRuntimeEOS(landmarks, eyeSide) {
 
         function startRecording() {
             const video = document.getElementById('video');
+            if (!video.srcObject || !streaming) {
+                alert('Start the camera first!');
+                return;
+            }
             const overlayCanvas = document.getElementById('overlay');
             const recCanvas = document.createElement('canvas');
             recCanvas.width = video.videoWidth || 640;
@@ -1571,14 +1575,22 @@ function computeRuntimeEOS(landmarks, eyeSide) {
             }, 1000 / 30);
             const stream = recCanvas.captureStream(30);
             const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' :
-                             MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8' : 'video/webm';
+                             MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8' :
+                             MediaRecorder.isTypeSupported('video/mp4') ? 'video/mp4' : '';
             recordedChunks = [];
             recordedData = [];
-            mediaRecorder = new MediaRecorder(stream, { mimeType });
+            try {
+                mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+            } catch (e) {
+                alert('Recording not supported: ' + e.message);
+                clearInterval(window._recInterval);
+                return;
+            }
             mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
             mediaRecorder.start(100);
             isRecording = true;
             recStartTime = Date.now();
+            document.getElementById('recTimer').textContent = '00:00';
             document.getElementById('recBtn').classList.add('recording');
             document.getElementById('recStopBtn').style.display = 'flex';
             document.getElementById('recIndicator').classList.add('active');
@@ -1587,22 +1599,23 @@ function computeRuntimeEOS(landmarks, eyeSide) {
         }
 
         function stopRecording() {
-            if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
-            mediaRecorder.stop();
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.onstop = () => {
+                    log('Recording stopped: ' + recordedChunks.length + ' chunks, ' + recordedData.length + ' data rows');
+                    if (recordedChunks.length > 0) {
+                        document.getElementById('recDownload').classList.add('visible');
+                    } else {
+                        log('WARNING: No video chunks captured!');
+                    }
+                };
+                mediaRecorder.stop();
+            }
             clearInterval(window._recInterval);
-            isRecording = false;
             clearInterval(recTimerInterval);
+            isRecording = false;
             document.getElementById('recBtn').classList.remove('recording');
             document.getElementById('recStopBtn').style.display = 'none';
             document.getElementById('recIndicator').classList.remove('active');
-            mediaRecorder.onstop = () => {
-                log('Recording stopped: ' + recordedChunks.length + ' chunks, ' + recordedData.length + ' data rows');
-                if (recordedChunks.length > 0) {
-                    document.getElementById('recDownload').classList.add('visible');
-                } else {
-                    log('WARNING: No video chunks captured!');
-                }
-            };
         }
 
         function updateRecTimer() {
