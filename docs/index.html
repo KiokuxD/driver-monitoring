@@ -1479,11 +1479,23 @@ function computeRuntimeEOS(landmarks, eyeSide) {
         }
 
         function startRecording() {
+            const video = document.getElementById('video');
             const overlayCanvas = document.getElementById('overlay');
-            const stream = overlayCanvas.captureStream(30);
+            const recCanvas = document.createElement('canvas');
+            recCanvas.width = video.videoWidth || 640;
+            recCanvas.height = video.videoHeight || 480;
+            const recCtx = recCanvas.getContext('2d');
+            window._recCanvas = recCanvas;
+            window._recInterval = setInterval(() => {
+                recCtx.drawImage(video, 0, 0, recCanvas.width, recCanvas.height);
+                recCtx.drawImage(overlayCanvas, 0, 0, recCanvas.width, recCanvas.height);
+            }, 1000 / 30);
+            const stream = recCanvas.captureStream(30);
+            const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' :
+                             MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8' : 'video/webm';
             recordedChunks = [];
             recordedData = [];
-            mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9' });
+            mediaRecorder = new MediaRecorder(stream, { mimeType });
             mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
             mediaRecorder.start(100);
             isRecording = true;
@@ -1498,12 +1510,15 @@ function computeRuntimeEOS(landmarks, eyeSide) {
         function stopRecording() {
             if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
             mediaRecorder.stop();
+            clearInterval(window._recInterval);
             isRecording = false;
             clearInterval(recTimerInterval);
             document.getElementById('recBtn').classList.remove('recording');
             document.getElementById('recStopBtn').style.display = 'none';
             document.getElementById('recIndicator').classList.remove('active');
-            document.getElementById('recDownload').classList.add('visible');
+            setTimeout(() => {
+                if (recordedChunks.length > 0) document.getElementById('recDownload').classList.add('visible');
+            }, 500);
         }
 
         function updateRecTimer() {
