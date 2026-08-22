@@ -1516,9 +1516,14 @@ function computeRuntimeEOS(landmarks, eyeSide) {
             document.getElementById('recBtn').classList.remove('recording');
             document.getElementById('recStopBtn').style.display = 'none';
             document.getElementById('recIndicator').classList.remove('active');
-            setTimeout(() => {
-                if (recordedChunks.length > 0) document.getElementById('recDownload').classList.add('visible');
-            }, 500);
+            mediaRecorder.onstop = () => {
+                log('Recording stopped: ' + recordedChunks.length + ' chunks, ' + recordedData.length + ' data rows');
+                if (recordedChunks.length > 0) {
+                    document.getElementById('recDownload').classList.add('visible');
+                } else {
+                    log('WARNING: No video chunks captured!');
+                }
+            };
         }
 
         function updateRecTimer() {
@@ -1534,23 +1539,30 @@ function computeRuntimeEOS(landmarks, eyeSide) {
         }
 
         function downloadVideo() {
+            if (!recordedChunks.length) { alert('No recording data. Record first!'); return; }
             const blob = new Blob(recordedChunks, { type: 'video/webm' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
-            a.href = url; a.download = 'recording-' + new Date().toISOString().slice(0, 19).replace(/:/g, '') + '.webm';
-            a.click(); URL.revokeObjectURL(url);
+            a.href = url;
+            a.download = 'recording-' + new Date().toISOString().slice(0, 19).replace(/:/g, '') + '.webm';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 3000);
         }
 
         function downloadCSV() {
-            if (!recordedData.length) return;
+            if (!recordedData.length) { alert('No data recorded. Record first!'); return; }
             const headers = ['timestamp_ms', 'leftEOS', 'rightEOS', 'mar', 'gazeRatio', 'yaw', 'pitch', 'blinkDetected', 'microSign'];
             const rows = recordedData.map(d => [d.t, d.leftEOS, d.rightEOS, d.mar, d.gazeRatio, d.yaw, d.pitch, d.blink ? 1 : 0, d.microSign || '']);
             const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
             const blob = new Blob([csv], { type: 'text/csv' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
-            a.href = url; a.download = 'data-' + new Date().toISOString().slice(0, 19).replace(/:/g, '') + '.csv';
-            a.click(); URL.revokeObjectURL(url);
+            a.href = url;
+            a.download = 'data-' + new Date().toISOString().slice(0, 19).replace(/:/g, '') + '.csv';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 3000);
         }
 
         window.startCamera = startCamera;
