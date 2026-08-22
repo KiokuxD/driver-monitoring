@@ -57,6 +57,7 @@
         <button class="btn" id="startBtn" onclick="startCamera()">Start Camera</button>
         <button class="btn stop" id="stopBtn" onclick="stopCamera()" disabled>Stop</button>
         <button class="btn" onclick="resetAlerts()">Reset</button>
+        <button id="calibrateBtn" onclick="showCalibrationOverlay()" style="background:#ffd93d; color:#000; border:none; padding:6px 12px; border-radius:6px; font-size:12px; cursor:pointer;">Calibrate</button>
     </div>
 
     <div class="section-title">Face Metrics</div>
@@ -82,6 +83,36 @@
     <div id="alertBox" class="safe">SAFE - No alerts</div>
     <div id="history"></div>
     <div id="log" style="margin-top:10px;text-align:left;font-size:0.7em;background:#111;color:#0f0;padding:8px;border-radius:8px;max-height:150px;overflow-y:auto;font-family:monospace;word-break:break-all;"></div>
+
+    <div id="calibrationOverlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); z-index:2000; align-items:center; justify-content:center;">
+        <div style="background:#1a1a2e; border:2px solid #00d4ff; border-radius:12px; padding:30px; text-align:center; color:white; max-width:400px; width:90%;">
+            <h2 id="calTitle" style="color:#00d4ff; margin-top:0;">Calibration</h2>
+            <p id="calInstruction" style="font-size:16px; line-height:1.5;">Close your eyes gently for 3 seconds</p>
+            <div style="width:100%; height:8px; background:#333; border-radius:4px; margin:15px 0; overflow:hidden;">
+                <div id="calProgressBar" style="height:100%; background:linear-gradient(90deg,#00d4ff,#00ff88); width:0%; transition:width 0.15s; border-radius:4px;"></div>
+            </div>
+            <p id="calStatus" style="color:#888; font-size:14px;">0 / 60 frames</p>
+            <div id="calEyeStatus" style="display:flex; justify-content:space-around; margin:15px 0;">
+                <div style="text-align:center;">
+                    <div style="color:#ff6b6b; font-size:12px;">LEFT EYE</div>
+                    <div id="calLeftStatus" style="color:#888; font-size:20px;">-</div>
+                </div>
+                <div style="text-align:center;">
+                    <div style="color:#ffd93d; font-size:12px;">RIGHT EYE</div>
+                    <div id="calRightStatus" style="color:#888; font-size:20px;">-</div>
+                </div>
+            </div>
+            <p id="calResult" style="display:none; font-size:14px;"></p>
+            <button id="calStartBtn" onclick="startCalibration()" style="background:#00d4ff; color:#000; border:none; padding:12px 30px; border-radius:8px; font-size:16px; font-weight:bold; cursor:pointer; margin-top:10px;">Start Calibration</button>
+            <button id="calCloseBtn" onclick="closeCalibrationOverlay()" style="display:none; background:#333; color:#fff; border:1px solid #555; padding:10px 25px; border-radius:8px; font-size:14px; cursor:pointer; margin-top:10px;">Close</button>
+        </div>
+    </div>
+
+    <div id="eyeDebugPanel" style="display:none; position:fixed; bottom:80px; left:10px; background:rgba(0,0,0,0.7); color:#fff; padding:8px 12px; border-radius:8px; font-size:11px; font-family:monospace; z-index:100;">
+        <div>Left EOS: <span id="debugLeftEOS">-</span> | State: <span id="debugLeftState">-</span></div>
+        <div>Right EOS: <span id="debugRightEOS">-</span> | State: <span id="debugRightState">-</span></div>
+        <div>Blinks: <span id="debugBlinks">0</span></div>
+    </div>
 
     <script type="module">
         import { FaceLandmarker, FilesetResolver } from
@@ -114,6 +145,7 @@
         let microsleepCount = 0;
         let blinkConsecCounter = 0; // Consecutive frames with EAR < threshold
         let blinkCount = 0; // Total blinks detected
+        let lastBlinkTime = 0;
 
         let eyeClosureSum = 0;
         let eyeClosureWindowStart = 0;
@@ -365,6 +397,320 @@
             return count;
         }
 
+        // ==================== CALIBRATION-BASED BLINK DETECTION ====================
+        // Pure classical CV — no AI/ML. Uses perpendicular distance from eyelid
+        // points to the eye axis (outer→inner corner line).
+
+        function computePerpendicularDistance(point, lineP1, lineP2) {
+            const dx = lineP2[0] - lineP1[0];
+            const dy = lineP2[1] - lineP1[1];
+            const len = Math.sqrt(dx * dx + dy * dy);
+            if (len < 1e-6) return 0;
+            const nx = -dy / len;
+            const ny = dx / len;
+            const px = point[0] - lineP1[0];
+            const py = point[1] - lineP1[1];
+            return nx * px + ny * py;
+        }
+
+const CAL_CONFIG = {
+    closedHoldFrames: 60,
+    openHoldFrames: 30,
+    minRange: 0.01,
+    thresholdFactor: 0.3,
+    openThresholdFactor: 0.4,
+    emaAlpha: 0.3,
+    minClosedFrames: 2,
+    minOpenFrames: 3
+};
+
+        const CALIBRATION = {
+            leftEye: {
+                closedDistances: null,
+                openDistances: null,
+                threshold: null,
+                state: 'NOT_CALIBRATED'
+            },
+            rightEye: {
+                closedDistances: null,
+                openDistances: null,
+                threshold: null,
+                state: 'NOT_CALIBRATED'
+            },
+            isComplete() {
+                return this.leftEye.state === 'CALIBRATED' && this.rightEye.state === 'CALIBRATED';
+            }
+        };
+
+function extractEyeLandmarks(landmarks, eyeSide) {
+    const indices = eyeSide === 'left'
+        ? [362, 385, 387, 263, 373, 380]
+        : [33, 160, 158, 133, 153, 144];
+    return indices.map(i => {
+        const lm = landmarks[i];
+        return lm ? [lm.x, lm.y] : null;
+    });
+}
+
+function computeCalibrationDistances(eyeLandmarks) {
+    if (eyeLandmarks.some(p => p === null)) return null;
+    const [outer, top1, top2, inner, bot1, bot2] = eyeLandmarks;
+            const d_top1 = computePerpendicularDistance(top1, outer, inner);
+            const d_top2 = computePerpendicularDistance(top2, outer, inner);
+            const d_bot1 = computePerpendicularDistance(bot1, outer, inner);
+            const d_bot2 = computePerpendicularDistance(bot2, outer, inner);
+            const eos = (Math.abs(d_top1) + Math.abs(d_top2) + Math.abs(d_bot1) + Math.abs(d_bot2)) / 4;
+            return { d_top1, d_top2, d_bot1, d_bot2, eos };
+        }
+
+        const calibrationBuffers = {
+            left: { closed: [], open: [] },
+            right: { closed: [], open: [] }
+        };
+
+        let calibrationPhase = 'IDLE';
+
+function collectCalibrationFrame(landmarks, eyeSide, state) {
+    const eyeLandmarks = extractEyeLandmarks(landmarks, eyeSide);
+    const distances = computeCalibrationDistances(eyeLandmarks);
+    if (!distances) return { collected: calibrationBuffers[eyeSide][state].length, target: state === 'closed' ? CAL_CONFIG.closedHoldFrames : CAL_CONFIG.openHoldFrames, ready: false };
+    calibrationBuffers[eyeSide][state].push(distances);
+            const targetFrames = state === 'closed' ? CAL_CONFIG.closedHoldFrames : CAL_CONFIG.openHoldFrames;
+            return {
+                collected: calibrationBuffers[eyeSide][state].length,
+                target: targetFrames,
+                ready: calibrationBuffers[eyeSide][state].length >= targetFrames
+            };
+        }
+
+        function finalizeCalibration(eyeSide) {
+            const buf = calibrationBuffers[eyeSide];
+            if (buf.closed.length < 10 || buf.open.length < 5) {
+                return { success: false, error: 'Not enough frames' };
+            }
+            const median = (arr) => {
+                const sorted = [...arr].sort((a, b) => a - b);
+                const mid = Math.floor(sorted.length / 2);
+                return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+            };
+            const closedEOS = buf.closed.map(f => f.eos);
+            const openEOS = buf.open.map(f => f.eos);
+            const closedMedian = median(closedEOS);
+            const openMedian = median(openEOS);
+            const range = openMedian - closedMedian;
+            if (range < CAL_CONFIG.minRange) {
+                return { success: false, error: 'Calibration range too small — open your eyes wider next time' };
+            }
+            const threshold = closedMedian + CAL_CONFIG.thresholdFactor * range;
+            CALIBRATION[eyeSide + 'Eye'] = {
+                closedDistances: {
+                    eos: closedMedian,
+                    d_top1: median(buf.closed.map(f => f.d_top1)),
+                    d_top2: median(buf.closed.map(f => f.d_top2)),
+                    d_bot1: median(buf.closed.map(f => f.d_bot1)),
+                    d_bot2: median(buf.closed.map(f => f.d_bot2))
+                },
+                openDistances: {
+                    eos: openMedian,
+                    d_top1: median(buf.open.map(f => f.d_top1)),
+                    d_top2: median(buf.open.map(f => f.d_top2)),
+                    d_bot1: median(buf.open.map(f => f.d_bot1)),
+                    d_bot2: median(buf.open.map(f => f.d_bot2))
+                },
+                threshold,
+                state: 'CALIBRATED'
+            };
+            return { success: true, threshold, range, closedEOS: closedMedian, openEOS: openMedian };
+        }
+
+        // ==================== CALIBRATION UI FLOW ====================
+
+function startCalibration() {
+    calibrationPhase = 'CLOSED_CAL';
+    calibrationBuffers.left = { closed: [], open: [] };
+    calibrationBuffers.right = { closed: [], open: [] };
+    eosSmoother.left.reset();
+    eosSmoother.right.reset();
+            
+            document.getElementById('calTitle').textContent = 'Step 1/2: Close Your Eyes';
+            document.getElementById('calInstruction').textContent = 'Close your eyes gently and hold for 3 seconds...';
+            document.getElementById('calStartBtn').style.display = 'none';
+            document.getElementById('calResult').style.display = 'none';
+            document.getElementById('calCloseBtn').style.display = 'none';
+            document.getElementById('calLeftStatus').textContent = '...';
+            document.getElementById('calRightStatus').textContent = '...';
+        }
+
+        function updateCalibrationUI(progressLeft, progressRight) {
+            const collected = Math.max(progressLeft.collected, progressRight.collected);
+            const target = progressLeft.target;
+            const pct = Math.min(100, (collected / target) * 100);
+            document.getElementById('calProgressBar').style.width = pct + '%';
+            document.getElementById('calStatus').textContent = collected + ' / ' + target + ' frames';
+            
+            if (progressLeft.ready) document.getElementById('calLeftStatus').textContent = '✓';
+            if (progressRight.ready) document.getElementById('calRightStatus').textContent = '✓';
+        }
+
+        function transitionCalibrationPhase() {
+            if (calibrationPhase === 'CLOSED_CAL') {
+                calibrationPhase = 'OPEN_CAL';
+                document.getElementById('calTitle').textContent = 'Step 2/2: Open Your Eyes';
+                document.getElementById('calInstruction').textContent = 'Open your eyes normally and look at the camera for 2 seconds...';
+                document.getElementById('calProgressBar').style.width = '0%';
+                document.getElementById('calStatus').textContent = '0 / 30 frames';
+                document.getElementById('calLeftStatus').textContent = '...';
+                document.getElementById('calRightStatus').textContent = '...';
+            }
+        }
+
+        function finishCalibration(leftResult, rightResult) {
+            calibrationPhase = 'DONE';
+            
+            const leftOk = leftResult.success;
+            const rightOk = rightResult.success;
+            
+            document.getElementById('calTitle').textContent = (leftOk && rightOk) ? 'Calibration Complete!' : 'Calibration Issues';
+            document.getElementById('calProgressBar').style.width = '100%';
+            
+            let resultText = '';
+            if (leftOk) {
+                resultText += 'Left: OK (threshold=' + leftResult.threshold.toFixed(4) + ')';
+                document.getElementById('calLeftStatus').textContent = '✓';
+            } else {
+                resultText += 'Left: FAILED — ' + leftResult.error;
+                document.getElementById('calLeftStatus').textContent = '✗';
+            }
+            resultText += '\n';
+            if (rightOk) {
+                resultText += 'Right: OK (threshold=' + rightResult.threshold.toFixed(4) + ')';
+                document.getElementById('calRightStatus').textContent = '✓';
+            } else {
+                resultText += 'Right: FAILED — ' + rightResult.error;
+                document.getElementById('calRightStatus').textContent = '✗';
+            }
+            
+            document.getElementById('calInstruction').textContent = 'Calibration data saved.';
+            document.getElementById('calResult').style.display = 'block';
+            document.getElementById('calResult').textContent = resultText;
+            document.getElementById('calResult').style.whiteSpace = 'pre-line';
+            document.getElementById('calResult').style.color = (leftOk && rightOk) ? '#00ff88' : '#ffd93d';
+            document.getElementById('calStatus').textContent = '';
+            document.getElementById('calCloseBtn').style.display = 'inline-block';
+        }
+
+        function closeCalibrationOverlay() {
+            document.getElementById('calibrationOverlay').style.display = 'none';
+        }
+
+        function showCalibrationOverlay() {
+    if (!streaming) {
+        log('⚠ Start the camera before calibrating');
+        return;
+    }
+            document.getElementById('calibrationOverlay').style.display = 'flex';
+            if (CALIBRATION.isComplete()) {
+                document.getElementById('calTitle').textContent = 'Recalibrate?';
+                document.getElementById('calInstruction').textContent = 'Eyes are already calibrated. Recalibrate?';
+                document.getElementById('calStartBtn').style.display = 'inline-block';
+                document.getElementById('calStartBtn').textContent = 'Recalibrate';
+                document.getElementById('calCloseBtn').style.display = 'inline-block';
+                document.getElementById('calResult').style.display = 'none';
+                document.getElementById('calLeftStatus').textContent = '✓';
+                document.getElementById('calRightStatus').textContent = '✓';
+            } else {
+                document.getElementById('calStartBtn').style.display = 'inline-block';
+                document.getElementById('calStartBtn').textContent = 'Start Calibration';
+            }
+        }
+
+        class EMAFilter {
+            constructor(alpha = 0.3) {
+                this.alpha = alpha;
+                this.value = null;
+            }
+            update(rawValue) {
+                if (this.value === null) this.value = rawValue;
+                else this.value = this.alpha * rawValue + (1 - this.alpha) * this.value;
+                return this.value;
+            }
+            reset() { this.value = null; }
+        }
+
+        const eosSmoother = {
+            left: new EMAFilter(CAL_CONFIG.emaAlpha),
+            right: new EMAFilter(CAL_CONFIG.emaAlpha)
+        };
+
+        class BlinkStateMachine {
+            constructor() {
+                this.state = 'OPEN';
+                this.closingCount = 0;
+                this.closedCount = 0;
+                this.openingCount = 0;
+                this.blinkCount = 0;
+                this.totalBlinkDuration = 0;
+                this.blinkStartFrame = 0;
+                this.frameCount = 0;
+            }
+            update(EOS, thresholdClose, thresholdOpen) {
+                let blink = false;
+                this.frameCount++;
+                switch (this.state) {
+                    case 'OPEN':
+                        if (EOS < thresholdClose) {
+                            this.state = 'CLOSING';
+                            this.closingCount = 0;
+                            this.blinkStartFrame = this.frameCount;
+                        }
+                        break;
+                    case 'CLOSING':
+                        this.closingCount++;
+                        if (EOS < thresholdClose && this.closingCount >= CAL_CONFIG.minClosedFrames) {
+                            this.state = 'CLOSED';
+                            this.closedCount = 0;
+                            blink = true;
+                            this.blinkCount++;
+                        } else if (EOS > thresholdOpen) {
+                            this.state = 'OPEN';
+                        }
+                        break;
+                    case 'CLOSED':
+                        this.closedCount++;
+                        if (EOS > thresholdOpen) {
+                            this.state = 'OPENING';
+                            this.openingCount = 0;
+                            this.totalBlinkDuration = this.frameCount - this.blinkStartFrame;
+                        }
+                        break;
+                    case 'OPENING':
+                        this.openingCount++;
+                        if (EOS > thresholdOpen && this.openingCount >= CAL_CONFIG.minOpenFrames) {
+                            this.state = 'OPEN';
+                        }
+                        break;
+                }
+                return { state: this.state, blink, blinkCount: this.blinkCount, duration: this.totalBlinkDuration };
+            }
+        }
+
+        const blinkMachines = {
+            left: new BlinkStateMachine(),
+            right: new BlinkStateMachine()
+        };
+
+function computeRuntimeEOS(landmarks, eyeSide) {
+    const eyeLandmarks = extractEyeLandmarks(landmarks, eyeSide);
+    const calib = CALIBRATION[eyeSide + 'Eye'];
+    if (calib.state !== 'CALIBRATED') return null;
+    const distances = computeCalibrationDistances(eyeLandmarks);
+    if (!distances) return null;
+            const range = calib.openDistances.eos - calib.closedDistances.eos;
+            if (range < 1e-6) return 0;
+            const normalized = (distances.eos - calib.closedDistances.eos) / range;
+            return Math.max(0, Math.min(1, normalized));
+        }
+
         // ==================== DETECT ====================
         function detect() {
             if (!streaming) return;
@@ -405,6 +751,72 @@
             const lm = results.faceLandmarks[0];
             const bs = results.faceBlendshapes && results.faceBlendshapes[0] && Array.isArray(results.faceBlendshapes[0]) ? results.faceBlendshapes[0] : [];
             const mat = results.facialTransformationMatrixes ? results.facialTransformationMatrixes[0] : null;
+
+            // === CALIBRATION DATA COLLECTION ===
+            let leftEOS = null, rightEOS = null;
+            let leftBlink = false, rightBlink = false;
+
+            if (calibrationPhase === 'CLOSED_CAL') {
+                const pL = collectCalibrationFrame(lm, 'left', 'closed');
+                const pR = collectCalibrationFrame(lm, 'right', 'closed');
+                updateCalibrationUI(pL, pR);
+                if (pL.ready && pR.ready) {
+                    transitionCalibrationPhase();
+                }
+            } else if (calibrationPhase === 'OPEN_CAL') {
+                const pL = collectCalibrationFrame(lm, 'left', 'open');
+                const pR = collectCalibrationFrame(lm, 'right', 'open');
+                updateCalibrationUI(pL, pR);
+                if (pL.ready && pR.ready) {
+                    const leftResult = finalizeCalibration('left');
+                    const rightResult = finalizeCalibration('right');
+                finishCalibration(leftResult, rightResult);
+                calibrationPhase = 'IDLE';
+                }
+            }
+
+            // === CALIBRATION-BASED BLINK DETECTION ===
+            if (CALIBRATION.isComplete() && calibrationPhase !== 'CLOSED_CAL' && calibrationPhase !== 'OPEN_CAL') {
+                const leftEOS_raw = computeRuntimeEOS(lm, 'left');
+                const rightEOS_raw = computeRuntimeEOS(lm, 'right');
+                
+                leftEOS = leftEOS_raw !== null ? eosSmoother.left.update(leftEOS_raw) : null;
+                rightEOS = rightEOS_raw !== null ? eosSmoother.right.update(rightEOS_raw) : null;
+                
+                // Use NORMALIZED thresholds since computeRuntimeEOS returns [0,1]
+                if (leftEOS !== null) {
+                    const lr = blinkMachines.left.update(
+                        leftEOS,
+                        CAL_CONFIG.thresholdFactor,
+                        CAL_CONFIG.thresholdFactor * CAL_CONFIG.openThresholdFactor
+                    );
+                    leftBlink = lr.blink;
+                }
+                if (rightEOS !== null) {
+                    const rr = blinkMachines.right.update(
+                        rightEOS,
+                        CAL_CONFIG.thresholdFactor,
+                        CAL_CONFIG.thresholdFactor * CAL_CONFIG.openThresholdFactor
+                    );
+                    rightBlink = rr.blink;
+                }
+                
+                // Combined blink: both eyes OR either eye
+                const calBlinkDetected = leftBlink || rightBlink;
+                
+                if (calBlinkDetected) {
+                    blinkTimestamps.push(Date.now());
+                    if (blinkTimestamps.length > 60) blinkTimestamps.shift();
+                }
+
+                // Update debug panel
+                document.getElementById('eyeDebugPanel').style.display = 'block';
+                document.getElementById('debugLeftEOS').textContent = leftEOS !== null ? leftEOS.toFixed(3) : '-';
+                document.getElementById('debugRightEOS').textContent = rightEOS !== null ? rightEOS.toFixed(3) : '-';
+                document.getElementById('debugLeftState').textContent = blinkMachines.left.state;
+                document.getElementById('debugRightState').textContent = blinkMachines.right.state;
+                document.getElementById('debugBlinks').textContent = blinkMachines.left.blinkCount + '/' + blinkMachines.right.blinkCount;
+            }
 
             // ---- Overlay: dots + polygon lines ----
             function drawPoly(ids, color, lw, close) {
@@ -718,6 +1130,7 @@
             if (video.srcObject) { video.srcObject.getTracks().forEach(t => t.stop()); video.srcObject = null; }
             document.getElementById('startBtn').disabled = false;
             document.getElementById('stopBtn').disabled = true;
+            document.getElementById('eyeDebugPanel').style.display = 'none';
             ctx.clearRect(0, 0, overlay.width, overlay.height);
         }
 
@@ -737,6 +1150,16 @@
             nodCount = 0;
             gazeOffStart = 0;
             percloseFrames = [];
+            calibrationPhase = 'IDLE';
+            calibrationBuffers.left = { closed: [], open: [] };
+            calibrationBuffers.right = { closed: [], open: [] };
+            blinkMachines.left = new BlinkStateMachine();
+            blinkMachines.right = new BlinkStateMachine();
+            eosSmoother.left.reset();
+            eosSmoother.right.reset();
+            CALIBRATION.leftEye.state = 'NOT_CALIBRATED';
+            CALIBRATION.rightEye.state = 'NOT_CALIBRATED';
+            document.getElementById('eyeDebugPanel').style.display = 'none';
             document.getElementById('alertBox').className = 'safe';
             document.getElementById('alertBox').textContent = 'SAFE - Alerts reset';
         }
@@ -744,6 +1167,9 @@
         window.startCamera = startCamera;
         window.stopCamera = stopCamera;
         window.resetAlerts = resetAlerts;
+        window.showCalibrationOverlay = showCalibrationOverlay;
+        window.startCalibration = startCalibration;
+        window.closeCalibrationOverlay = closeCalibrationOverlay;
 
         loadModel();
     </script>
