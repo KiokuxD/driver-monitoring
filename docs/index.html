@@ -833,12 +833,6 @@ function computeRuntimeEOS(landmarks, eyeSide) {
             return check(eosHistoryLeft) || check(eosHistoryRight);
         }
 
-        function getBlinkRate() {
-            const now = Date.now();
-            const oneMinAgo = now - 60000;
-            return blinkTimestamps.filter(t => t > oneMinAgo).length;
-        }
-
         function resetBlinkFilterState() {
             prevNoseX = null;
             headVelFreezeCounter = 0;
