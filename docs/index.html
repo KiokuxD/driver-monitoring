@@ -188,6 +188,20 @@
         let headVelFreezeCounter = 0;
         let eosHistoryLeft = [];
         let eosHistoryRight = [];
+
+        const blinkDetector = {
+            state: 'IDLE',
+            stateFrames: 0,
+            baseline: 0.95,
+            baselineBuffer: [],
+            prevEOS: 0.95,
+            prevTime: 0,
+            closingStartTime: 0,
+            peakEOS: 0.95,
+            blinkCount: 0,
+            velCloseThresh: -0.3,
+            velOpenThresh: 0.15
+        };
         let slowBlinkCount = 0;
         let microsleepCount = 0;
         let blinkConsecCounter = 0; // Consecutive frames with EAR < threshold
@@ -838,6 +852,13 @@ function computeRuntimeEOS(landmarks, eyeSide) {
             headVelFreezeCounter = 0;
             eosHistoryLeft = [];
             eosHistoryRight = [];
+            blinkDetector.state = 'IDLE';
+            blinkDetector.stateFrames = 0;
+            blinkDetector.baseline = 0.95;
+            blinkDetector.baselineBuffer = [];
+            blinkDetector.prevEOS = 0.95;
+            blinkDetector.prevTime = 0;
+            blinkDetector.blinkCount = 0;
         }
 
         // ==================== DETECT ====================
@@ -932,41 +953,90 @@ function computeRuntimeEOS(landmarks, eyeSide) {
                     leftEOS = leftEOS_raw !== null ? eosSmoother.left.update(leftEOS_raw) : null;
                     rightEOS = rightEOS_raw !== null ? eosSmoother.right.update(rightEOS_raw) : null;
 
-                    if (leftEOS !== null) { eosHistoryLeft.push(leftEOS); if (eosHistoryLeft.length > 5) eosHistoryLeft.shift(); }
-                    if (rightEOS !== null) { eosHistoryRight.push(rightEOS); if (eosHistoryRight.length > 5) eosHistoryRight.shift(); }
+                    // Average both eyes for robust blink detection
+                    const avgEOS = (leftEOS !== null && rightEOS !== null) ? (leftEOS + rightEOS) / 2 :
+                                   leftEOS !== null ? leftEOS : rightEOS;
 
-                    const crossCorrelated = isCrossEyeCorrelated();
-                    const accelBad = isAccelerationTooHigh();
+                    if (avgEOS !== null) {
+                        const now = performance.now();
+                        const dt = blinkDetector.prevTime > 0 ? (now - blinkDetector.prevTime) / 1000 : 0;
+                        blinkDetector.prevTime = now;
 
-                    const bothOpen = blinkMachines.left.state === 'OPEN' && blinkMachines.right.state === 'OPEN';
+                        if (dt > 0 && dt < 0.5) {
+                            // Compute velocity (derivative of EOS)
+                            const velocity = (avgEOS - blinkDetector.prevEOS) / dt;
+                            blinkDetector.prevEOS = avgEOS;
 
-                    if ((crossCorrelated || accelBad) && bothOpen) {
-                        blinkMachines.left.state = 'OPEN';
-                        blinkMachines.left.closingCount = 0;
-                        blinkMachines.left.closedCount = 0;
-                        blinkMachines.left.openingCount = 0;
-                        blinkMachines.left.prevEOS = leftEOS;
-                        blinkMachines.right.state = 'OPEN';
-                        blinkMachines.right.closingCount = 0;
-                        blinkMachines.right.closedCount = 0;
-                        blinkMachines.right.openingCount = 0;
-                        blinkMachines.right.prevEOS = rightEOS;
-                    } else {
-                        if (leftEOS !== null) {
-                            const lr = blinkMachines.left.update(
-                                leftEOS,
-                                CAL_CONFIG.thresholdFactor,
-                                CAL_CONFIG.thresholdFactor * CAL_CONFIG.openThresholdFactor
-                            );
-                            leftBlink = lr.blink;
-                        }
-                        if (rightEOS !== null) {
-                            const rr = blinkMachines.right.update(
-                                rightEOS,
-                                CAL_CONFIG.thresholdFactor,
-                                CAL_CONFIG.thresholdFactor * CAL_CONFIG.openThresholdFactor
-                            );
-                            rightBlink = rr.blink;
+                            // Update adaptive baseline (rolling median of open-eye EOS)
+                            if (blinkDetector.state === 'IDLE') {
+                                blinkDetector.baselineBuffer.push(avgEOS);
+                                if (blinkDetector.baselineBuffer.length > 60) blinkDetector.baselineBuffer.shift();
+                                const sorted = [...blinkDetector.baselineBuffer].sort((a, b) => a - b);
+                                blinkDetector.baseline = sorted[Math.floor(sorted.length / 2)];
+                            }
+
+                            const dip = blinkDetector.baseline - avgEOS;
+                            const dipPercent = blinkDetector.baseline > 0 ? dip / blinkDetector.baseline : 0;
+
+                            // State machine: velocity-based blink detection
+                            blinkDetector.stateFrames++;
+
+                            if (blinkDetector.state === 'IDLE') {
+                                // Detect closing: velocity negative + significant dip from baseline
+                                if (velocity < blinkDetector.velCloseThresh && dipPercent > 0.08) {
+                                    blinkDetector.state = 'CLOSING';
+                                    blinkDetector.closingStartTime = now;
+                                    blinkDetector.peakEOS = avgEOS;
+                                    blinkDetector.stateFrames = 0;
+                                }
+                            } else if (blinkDetector.state === 'CLOSING') {
+                                // Track lowest point
+                                if (avgEOS < blinkDetector.peakEOS) {
+                                    blinkDetector.peakEOS = avgEOS;
+                                }
+                                const blinkDuration = (now - blinkDetector.closingStartTime) / 1000;
+
+                                // Too long for a blink → abort
+                                if (blinkDuration > 0.6) {
+                                    blinkDetector.state = 'IDLE';
+                                    blinkDetector.stateFrames = 0;
+                                }
+                                // Velocity crosses zero (closing → opening) = V-bottom
+                                else if (velocity > 0.05 && blinkDetector.stateFrames >= 1) {
+                                    blinkDetector.state = 'OPENING';
+                                    blinkDetector.stateFrames = 0;
+                                }
+                            } else if (blinkDetector.state === 'OPENING') {
+                                const blinkDuration = (now - blinkDetector.closingStartTime) / 1000;
+                                const recoveryRatio = (blinkDetector.baseline - blinkDetector.peakEOS) > 0.01 ?
+                                    (avgEOS - blinkDetector.peakEOS) / (blinkDetector.baseline - blinkDetector.peakEOS) : 1;
+
+                                // Blink confirmed: recovered to 70%+ and duration is reasonable
+                                if (recoveryRatio > 0.7 && blinkDuration < 0.6 && blinkDuration > 0.03) {
+                                    blinkDetector.blinkCount++;
+                                    blinkDetector.state = 'RECOVERED';
+                                    blinkDetector.stateFrames = 0;
+                                    leftBlink = true;
+                                    rightBlink = true;
+                                }
+                                // Timeout
+                                else if (blinkDuration > 0.6) {
+                                    blinkDetector.state = 'IDLE';
+                                    blinkDetector.stateFrames = 0;
+                                }
+                                // Velocity went negative again → false alarm
+                                else if (velocity < blinkDetector.velCloseThresh && blinkDetector.stateFrames >= 2) {
+                                    blinkDetector.state = 'IDLE';
+                                    blinkDetector.stateFrames = 0;
+                                }
+                            } else if (blinkDetector.state === 'RECOVERED') {
+                                if (blinkDetector.stateFrames >= 2) {
+                                    blinkDetector.state = 'IDLE';
+                                    blinkDetector.stateFrames = 0;
+                                }
+                            }
+                        } else {
+                            blinkDetector.prevEOS = avgEOS;
                         }
                     }
                     
@@ -985,9 +1055,9 @@ function computeRuntimeEOS(landmarks, eyeSide) {
                 document.getElementById('eyeDebugPanel').style.display = 'block';
                 document.getElementById('debugLeftEOS').textContent = leftEOS !== null ? leftEOS.toFixed(3) : '-';
                 document.getElementById('debugRightEOS').textContent = rightEOS !== null ? rightEOS.toFixed(3) : '-';
-                document.getElementById('debugLeftState').textContent = blinkMachines.left.state;
-                document.getElementById('debugRightState').textContent = blinkMachines.right.state;
-                document.getElementById('debugBlinks').textContent = blinkMachines.left.blinkCount + '/' + blinkMachines.right.blinkCount;
+                document.getElementById('debugLeftState').textContent = blinkDetector.state;
+                document.getElementById('debugRightState').textContent = 'baseline:' + blinkDetector.baseline.toFixed(2);
+                document.getElementById('debugBlinks').textContent = blinkDetector.blinkCount + '';
             }
 
             // ---- Overlay: dots + polygon lines ----
@@ -1110,7 +1180,16 @@ function computeRuntimeEOS(landmarks, eyeSide) {
             let yaw = 0, pitch = 0;
             if (mat) {
                 const e = matrixToEuler(mat);
-                yaw = e.yaw; pitch = e.pitch;
+                if (!isNaN(e.yaw) && !isNaN(e.pitch)) {
+                    yaw = e.yaw; pitch = e.pitch;
+                } else {
+                    const nose = lm[1], lEye = lm[33], rEye = lm[263], fore = lm[10], chin = lm[152];
+                    const eyeCx = (lEye.x + rEye.x) / 2;
+                    const eyeW = dist(lEye, rEye);
+                    const faceH = dist(fore, chin);
+                    yaw = ((nose.x - eyeCx) / eyeW) * 50;
+                    pitch = ((nose.y - (fore.y + chin.y) / 2) / (faceH * 0.5)) * 50;
+                }
             } else {
                 const nose = lm[1], lEye = lm[33], rEye = lm[263], fore = lm[10], chin = lm[152];
                 const eyeCx = (lEye.x + rEye.x) / 2;
