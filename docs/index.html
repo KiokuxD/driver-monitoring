@@ -36,6 +36,28 @@
         #history { max-height: 120px; overflow-y: auto; text-align: left; font-size: 0.75em; background: #16213e; padding: 8px; border-radius: 8px; margin-top: 10px; }
         #history div { padding: 2px 0; border-bottom: 1px solid #1a1a3e; }
         .section-title { font-size: 0.7em; color: #00d4ff; margin: 8px 0 4px; text-transform: uppercase; letter-spacing: 1px; }
+        #chartContainer { position: relative; width: 100%; max-width: 640px; margin: 8px auto; background: #0a0e1a; border: 1px solid #1a2744; border-radius: 8px; overflow: hidden; touch-action: none; }
+        #chartCanvas { width: 100%; height: 200px; display: block; cursor: grab; }
+        #chartCanvas:active { cursor: grabbing; }
+        .chart-legend { display: flex; flex-wrap: wrap; gap: 6px 12px; padding: 4px 8px 6px; background: #0d1220; border-top: 1px solid #1a2744; }
+        .chart-legend-item { display: flex; align-items: center; gap: 4px; font-size: 0.65em; color: #aaa; }
+        .chart-legend-dot { width: 8px; height: 3px; border-radius: 1px; flex-shrink: 0; }
+        .rec-controls { display: inline-flex; align-items: center; gap: 8px; margin: 8px 0; }
+        .rec-btn { width: 44px; height: 44px; border-radius: 50%; border: 3px solid #444; background: #1a1a2e; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.2s; }
+        .rec-btn:hover { border-color: #f44336; }
+        .rec-dot { width: 18px; height: 18px; border-radius: 50%; background: #f44336; }
+        .rec-btn.recording .rec-dot { animation: recPulse 1s infinite; }
+        .rec-stop { width: 44px; height: 44px; border-radius: 50%; border: 3px solid #444; background: #1a1a2e; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+        .rec-stop:hover { border-color: #f44336; }
+        .rec-stop-inner { width: 14px; height: 14px; border-radius: 3px; background: #f44336; }
+        .rec-timer { font-family: monospace; font-size: 1.1em; color: #f44336; min-width: 50px; text-align: center; }
+        @keyframes recPulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.8); } }
+        .rec-indicator { display: none; position: absolute; top: 8px; left: 8px; background: rgba(244,67,54,0.85); padding: 3px 10px; border-radius: 4px; font-size: 0.75em; font-weight: bold; z-index: 5; }
+        .rec-indicator.active { display: flex; align-items: center; gap: 5px; }
+        .rec-indicator .dot { width: 8px; height: 8px; border-radius: 50%; background: #fff; animation: recPulse 1s infinite; }
+        .rec-download { display: none; gap: 6px; margin: 8px 0; flex-wrap: wrap; justify-content: center; }
+        .rec-download.visible { display: flex; }
+        .rec-download .btn { font-size: 0.85em; padding: 8px 16px; }
     </style>
 </head>
 <body>
@@ -51,6 +73,12 @@
         <video id="video" autoplay playsinline muted></video>
         <canvas id="overlay"></canvas>
         <div id="fps">FPS: 0</div>
+        <div class="rec-indicator" id="recIndicator"><div class="dot"></div>REC</div>
+    </div>
+
+    <div id="chartContainer">
+        <canvas id="chartCanvas"></canvas>
+        <div class="chart-legend" id="chartLegend"></div>
     </div>
 
     <div class="controls">
@@ -58,6 +86,20 @@
         <button class="btn stop" id="stopBtn" onclick="stopCamera()" disabled>Stop</button>
         <button class="btn" onclick="resetAlerts()">Reset</button>
         <button id="calibrateBtn" onclick="showCalibrationOverlay()" style="background:#ffd93d; color:#000; border:none; padding:6px 12px; border-radius:6px; font-size:12px; cursor:pointer;">Calibrate</button>
+    </div>
+
+    <div class="rec-controls">
+        <button class="rec-btn" id="recBtn" onclick="toggleRecording()">
+            <div class="rec-dot"></div>
+        </button>
+        <div class="rec-timer" id="recTimer">00:00</div>
+        <button class="rec-stop" id="recStopBtn" onclick="stopRecording()" style="display:none">
+            <div class="rec-stop-inner"></div>
+        </button>
+    </div>
+    <div class="rec-download" id="recDownload">
+        <button class="btn" onclick="downloadVideo()">Download Video</button>
+        <button class="btn" onclick="downloadCSV()">Download Data (CSV)</button>
     </div>
 
     <div class="section-title">Face Metrics</div>
@@ -142,6 +184,10 @@
         let blinkStart = 0;
         let blinkDurations = [];
         let blinkTimestamps = [];
+        let prevNoseX = null;
+        let headVelFreezeCounter = 0;
+        let eosHistoryLeft = [];
+        let eosHistoryRight = [];
         let slowBlinkCount = 0;
         let microsleepCount = 0;
         let blinkConsecCounter = 0; // Consecutive frames with EAR < threshold
@@ -425,8 +471,11 @@ const CAL_CONFIG = {
     minOpenFrames: 2,
     headPoseGateYaw: 30,
     headPoseGatePitch: 20,
-    eosVelocityThreshold: 0.15,
-    maxEosChangePerFrame: 0.18
+    headVelFreezeThreshold: 0.035,
+    headVelFreezeDuration: 6,
+    crossEyeCorrelationThreshold: 0.12,
+    accelThreshold: 0.10,
+    maxBlinkRatePerMin: 30
 };
 
         const CALIBRATION = {
@@ -766,6 +815,37 @@ function computeRuntimeEOS(landmarks, eyeSide) {
             return Math.max(0, Math.min(1, normalized));
         }
 
+        function isCrossEyeCorrelated() {
+            if (eosHistoryLeft.length < 2 || eosHistoryRight.length < 2) return false;
+            const dropL = eosHistoryLeft[eosHistoryLeft.length - 2] - eosHistoryLeft[eosHistoryLeft.length - 1];
+            const dropR = eosHistoryRight[eosHistoryRight.length - 2] - eosHistoryRight[eosHistoryRight.length - 1];
+            return dropL > CAL_CONFIG.crossEyeCorrelationThreshold &&
+                   dropR > CAL_CONFIG.crossEyeCorrelationThreshold;
+        }
+
+        function isAccelerationTooHigh() {
+            const check = (hist) => {
+                if (hist.length < 3) return false;
+                const n = hist.length;
+                const a2 = hist[n - 1] - 2 * hist[n - 2] + hist[n - 3];
+                return Math.abs(a2) > CAL_CONFIG.accelThreshold;
+            };
+            return check(eosHistoryLeft) || check(eosHistoryRight);
+        }
+
+        function getBlinkRate() {
+            const now = Date.now();
+            const oneMinAgo = now - 60000;
+            return blinkTimestamps.filter(t => t > oneMinAgo).length;
+        }
+
+        function resetBlinkFilterState() {
+            prevNoseX = null;
+            headVelFreezeCounter = 0;
+            eosHistoryLeft = [];
+            eosHistoryRight = [];
+        }
+
         // ==================== DETECT ====================
         function detect() {
             if (!streaming) return;
@@ -842,35 +922,68 @@ function computeRuntimeEOS(landmarks, eyeSide) {
                 const quickPitch = faceH > 0 ? ((nose.y - (fore.y + chin.y) / 2) / (faceH * 0.5)) * 50 : 0;
                 const headStable = Math.abs(quickYaw) < CAL_CONFIG.headPoseGateYaw && Math.abs(quickPitch) < CAL_CONFIG.headPoseGatePitch;
                 
-                if (headStable) {
+                // Head velocity gate — freeze detection during fast lateral movement
+                const noseDeltaX = prevNoseX !== null ? Math.abs(nose.x - prevNoseX) : 0;
+                prevNoseX = nose.x;
+                if (noseDeltaX > CAL_CONFIG.headVelFreezeThreshold) {
+                    headVelFreezeCounter = CAL_CONFIG.headVelFreezeDuration;
+                }
+                const detectionFrozen = headVelFreezeCounter > 0;
+                if (headVelFreezeCounter > 0) headVelFreezeCounter--;
+
+                if (headStable && !detectionFrozen) {
                     const leftEOS_raw = computeRuntimeEOS(lm, 'left');
                     const rightEOS_raw = computeRuntimeEOS(lm, 'right');
                     
                     leftEOS = leftEOS_raw !== null ? eosSmoother.left.update(leftEOS_raw) : null;
                     rightEOS = rightEOS_raw !== null ? eosSmoother.right.update(rightEOS_raw) : null;
-                    
-                    if (leftEOS !== null) {
-                        const lr = blinkMachines.left.update(
-                            leftEOS,
-                            CAL_CONFIG.thresholdFactor,
-                            CAL_CONFIG.thresholdFactor * CAL_CONFIG.openThresholdFactor
-                        );
-                        leftBlink = lr.blink;
-                    }
-                    if (rightEOS !== null) {
-                        const rr = blinkMachines.right.update(
-                            rightEOS,
-                            CAL_CONFIG.thresholdFactor,
-                            CAL_CONFIG.thresholdFactor * CAL_CONFIG.openThresholdFactor
-                        );
-                        rightBlink = rr.blink;
+
+                    if (leftEOS !== null) { eosHistoryLeft.push(leftEOS); if (eosHistoryLeft.length > 5) eosHistoryLeft.shift(); }
+                    if (rightEOS !== null) { eosHistoryRight.push(rightEOS); if (eosHistoryRight.length > 5) eosHistoryRight.shift(); }
+
+                    const crossCorrelated = isCrossEyeCorrelated();
+                    const accelBad = isAccelerationTooHigh();
+
+                    const bothOpen = blinkMachines.left.state === 'OPEN' && blinkMachines.right.state === 'OPEN';
+
+                    if ((crossCorrelated || accelBad) && bothOpen) {
+                        blinkMachines.left.state = 'OPEN';
+                        blinkMachines.left.closingCount = 0;
+                        blinkMachines.left.closedCount = 0;
+                        blinkMachines.left.openingCount = 0;
+                        blinkMachines.left.prevEOS = leftEOS;
+                        blinkMachines.right.state = 'OPEN';
+                        blinkMachines.right.closingCount = 0;
+                        blinkMachines.right.closedCount = 0;
+                        blinkMachines.right.openingCount = 0;
+                        blinkMachines.right.prevEOS = rightEOS;
+                    } else {
+                        if (leftEOS !== null) {
+                            const lr = blinkMachines.left.update(
+                                leftEOS,
+                                CAL_CONFIG.thresholdFactor,
+                                CAL_CONFIG.thresholdFactor * CAL_CONFIG.openThresholdFactor
+                            );
+                            leftBlink = lr.blink;
+                        }
+                        if (rightEOS !== null) {
+                            const rr = blinkMachines.right.update(
+                                rightEOS,
+                                CAL_CONFIG.thresholdFactor,
+                                CAL_CONFIG.thresholdFactor * CAL_CONFIG.openThresholdFactor
+                            );
+                            rightBlink = rr.blink;
+                        }
                     }
                     
                     const calBlinkDetected = leftBlink || rightBlink;
                     
                     if (calBlinkDetected) {
-                        blinkTimestamps.push(Date.now());
-                        if (blinkTimestamps.length > 60) blinkTimestamps.shift();
+                        const rate = getBlinkRate();
+                        if (rate <= CAL_CONFIG.maxBlinkRatePerMin) {
+                            blinkTimestamps.push(Date.now());
+                            if (blinkTimestamps.length > 60) blinkTimestamps.shift();
+                        }
                     }
                 }
 
@@ -1108,6 +1221,17 @@ function computeRuntimeEOS(landmarks, eyeSide) {
                 nodCount, alerts, blinkCount
             });
 
+            // ---- Push to chart (10Hz) + recording data ----
+            if (frameIdx % 3 === 0) {
+                const chartEvents = [];
+                if (blinkDetected) chartEvents.push({ label: 'blink', color: '#00d4ff' });
+                if (mar > MAR_THRESHOLD) chartEvents.push({ label: 'yawn', color: '#ff4444' });
+                if (Math.abs(adjYaw) > 30) chartEvents.push({ label: 'head_turn', color: '#ff9800' });
+                if (adjPitch > 25) chartEvents.push({ label: 'head_down', color: '#aa88ff' });
+                if (chart) chart.pushData(ear, mar, gazeResult.confidence * (gazeResult.direction === 'center' ? 1 : -1), adjYaw, adjPitch, chartEvents);
+                pushRecordingFrame({ leftEOS: leftEOS, rightEOS: rightEOS, mar, gazeRatio: gazeResult.confidence * (gazeResult.direction === 'center' ? 1 : -1), yaw: adjYaw, pitch: adjPitch, blink: blinkDetected, microSign: alerts.join(';') });
+            }
+
             frameCount++;
             if (Date.now() - lastFpsTime >= 1000) {
                 document.getElementById('fps').textContent = 'FPS: ' + frameCount;
@@ -1177,14 +1301,14 @@ function computeRuntimeEOS(landmarks, eyeSide) {
                 eyeClosureFrameCount = 0;
                 blinkDurations = [];
                 blinkTimestamps = [];
-                slowBlinkCount = 0;
+                resetBlinkFilterState();
                 microsleepCount = 0;
                 nodCount = 0;
                 gazeOffStart = 0;
                 document.getElementById('startBtn').disabled = true;
                 document.getElementById('stopBtn').disabled = false;
                 log('Camera started, waiting for video...');
-                video.onloadedmetadata = () => { log(`Video: ${video.videoWidth}x${video.videoHeight}`); detect(); };
+                video.onloadedmetadata = () => { log(`Video: ${video.videoWidth}x${video.videoHeight}`); initChart(); detect(); };
             } catch (err) {
                 alert('Camera error: ' + err.message);
             }
@@ -1197,9 +1321,9 @@ function computeRuntimeEOS(landmarks, eyeSide) {
             document.getElementById('stopBtn').disabled = true;
             document.getElementById('eyeDebugPanel').style.display = 'none';
             ctx.clearRect(0, 0, overlay.width, overlay.height);
-        }
-
-        function resetAlerts() {
+            if (chart) chart.reset();
+            if (isRecording) stopRecording();
+        }        function resetAlerts() {
             frameIdx = 0;
             calibrated = false;
             lastVideoTime = -1;
@@ -1208,8 +1332,8 @@ function computeRuntimeEOS(landmarks, eyeSide) {
             eyeClosureFrameCount = 0;
             blinkDurations = [];
             blinkTimestamps = [];
+            resetBlinkFilterState();
             slowBlinkCount = 0;
-            microsleepCount = 0;
             blinkConsecCounter = 0;
             blinkCount = 0;
             nodCount = 0;
@@ -1227,6 +1351,197 @@ function computeRuntimeEOS(landmarks, eyeSide) {
             document.getElementById('eyeDebugPanel').style.display = 'none';
             document.getElementById('alertBox').className = 'safe';
             document.getElementById('alertBox').textContent = 'SAFE - Alerts reset';
+            if (chart) chart.reset();
+        }
+
+        // ==================== REALTIME SCROLLING CHART ====================
+        class RealtimeChart {
+            constructor(canvasId, legendId) {
+                this.canvas = document.getElementById(canvasId);
+                this.ctx = this.canvas.getContext('2d');
+                this.dpr = window.devicePixelRatio || 1;
+                this.CHANNELS = [
+                    { key: 'ear',   label: 'EAR',   color: '#00d4ff', min: 0, max: 0.5 },
+                    { key: 'mar',   label: 'MAR',   color: '#ff4444', min: 0, max: 1.0 },
+                    { key: 'gaze',  label: 'Gaze',  color: '#00ff88', min: -1, max: 1 },
+                    { key: 'yaw',   label: 'Yaw',   color: '#ff9800', min: -40, max: 40 },
+                    { key: 'pitch', label: 'Pitch', color: '#aa88ff', min: -30, max: 30 }
+                ];
+                this.SAMPLE_RATE = 10;
+                this.WINDOW_SEC = 30;
+                this.BUF_SIZE = this.SAMPLE_RATE * this.WINDOW_SEC;
+                this.buffers = this.CHANNELS.map(() => new Float32Array(this.BUF_SIZE));
+                this.events = [];
+                this.maxEvents = 50;
+                this.writeIdx = 0;
+                this.count = 0;
+                this.lastSampleTime = 0;
+                this.panOffset = 0;
+                this.isPanning = false;
+                this.panStartX = 0;
+                this.panStartOffset = 0;
+                this._resize();
+                this._bindEvents();
+                this._buildLegend();
+                this._loop();
+            }
+            _resize() {
+                const rect = this.canvas.parentElement.getBoundingClientRect();
+                this.w = rect.width;
+                this.h = 200;
+                this.canvas.width = this.w * this.dpr;
+                this.canvas.height = this.h * this.dpr;
+                this.canvas.style.width = this.w + 'px';
+                this.canvas.style.height = this.h + 'px';
+                this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+            }
+            _buildLegend() {
+                document.getElementById('chartLegend').innerHTML = this.CHANNELS.map(c =>
+                    `<div class="chart-legend-item"><span class="chart-legend-dot" style="background:${c.color}"></span>${c.label}</div>`
+                ).join('') + `<div class="chart-legend-item"><span class="chart-legend-dot" style="background:#ffeb3b"></span>Event</div>`;
+            }
+            _bindEvents() {
+                const c = this.canvas;
+                c.addEventListener('mousedown', e => { this.isPanning = true; this.panStartX = e.clientX; this.panStartOffset = this.panOffset; });
+                window.addEventListener('mousemove', e => { if (!this.isPanning) return; const dx = e.clientX - this.panStartX; this.panOffset = Math.max(0, Math.min(this.count - 10, this.panStartOffset + dx * (this.BUF_SIZE / this.w))); });
+                window.addEventListener('mouseup', () => { this.isPanning = false; });
+                c.addEventListener('touchstart', e => { if (e.touches.length === 1) { this.isPanning = true; this.panStartX = e.touches[0].clientX; this.panStartOffset = this.panOffset; } }, { passive: true });
+                c.addEventListener('touchmove', e => { if (!this.isPanning || e.touches.length !== 1) return; const dx = e.touches[0].clientX - this.panStartX; this.panOffset = Math.max(0, Math.min(this.count - 10, this.panStartOffset + dx * (this.BUF_SIZE / this.w))); }, { passive: true });
+                c.addEventListener('touchend', () => { this.isPanning = false; });
+                window.addEventListener('resize', () => this._resize());
+            }
+            pushData(ear, mar, gazeRatio, yaw, pitch, events) {
+                const now = performance.now();
+                if (now - this.lastSampleTime < 1000 / this.SAMPLE_RATE) return;
+                this.lastSampleTime = now;
+                const idx = this.writeIdx % this.BUF_SIZE;
+                this.buffers[0][idx] = ear; this.buffers[1][idx] = mar; this.buffers[2][idx] = gazeRatio;
+                this.buffers[3][idx] = yaw; this.buffers[4][idx] = pitch;
+                this.writeIdx++;
+                if (this.count < this.BUF_SIZE) this.count++;
+                if (events && events.length) {
+                    for (const ev of events) this.events.push({ time: now, label: ev.label, color: ev.color });
+                    if (this.events.length > this.maxEvents) this.events = this.events.slice(-this.maxEvents);
+                }
+                if (!this.isPanning) this.panOffset = 0;
+            }
+            _loop() { this.draw(); requestAnimationFrame(() => this._loop()); }
+            draw() {
+                const { ctx, w, h } = this;
+                ctx.clearRect(0, 0, w, h);
+                if (this.count < 2) { ctx.fillStyle = '#555'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('Waiting for data...', w / 2, h / 2); return; }
+                const padL = 4, padR = 4, padT = 8, padB = 18;
+                const cw = w - padL - padR, ch = h - padT - padB;
+                const visibleSamples = Math.min(this.BUF_SIZE, Math.round(cw / 2));
+                const endIdx = this.count - Math.round(this.panOffset);
+                const startIdx = Math.max(0, endIdx - visibleSamples);
+                const now = performance.now();
+                const msPerSample = 1000 / this.SAMPLE_RATE;
+                const tEnd = now - (this.count - endIdx) * msPerSample;
+                const tStart = tEnd - visibleSamples * msPerSample;
+                ctx.strokeStyle = '#1a2744'; ctx.lineWidth = 0.5; ctx.font = '9px sans-serif'; ctx.fillStyle = '#445'; ctx.textAlign = 'center';
+                for (let sec = Math.ceil(tStart / 5000) * 5000; sec <= tEnd; sec += 5000) {
+                    const x = padL + ((sec - tStart) / (tEnd - tStart)) * cw;
+                    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + ch); ctx.stroke();
+                    ctx.fillText(sec === Math.round(now / 5000) * 5000 ? 'now' : ((sec - now) / 1000).toFixed(0) + 's', x, h - 3);
+                }
+                for (let c = 0; c < this.CHANNELS.length; c++) {
+                    const chDef = this.CHANNELS[c], buf = this.buffers[c], range = chDef.max - chDef.min;
+                    ctx.strokeStyle = chDef.color; ctx.lineWidth = 1.2; ctx.globalAlpha = 0.9; ctx.beginPath();
+                    let started = false;
+                    for (let i = startIdx; i < endIdx; i++) {
+                        const bufIdx = ((i % this.BUF_SIZE) + this.BUF_SIZE) % this.BUF_SIZE;
+                        const x = padL + ((i - startIdx) / visibleSamples) * cw;
+                        const y = padT + ch - ((buf[bufIdx] - chDef.min) / range) * ch;
+                        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+                    }
+                    ctx.stroke(); ctx.globalAlpha = 1;
+                }
+                for (const ev of this.events) {
+                    if (ev.time < tStart || ev.time > tEnd) continue;
+                    const x = padL + ((ev.time - tStart) / (tEnd - tStart)) * cw;
+                    ctx.strokeStyle = ev.color || '#ffeb3b'; ctx.lineWidth = 1; ctx.globalAlpha = 0.7;
+                    ctx.setLineDash([2, 2]); ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + ch); ctx.stroke();
+                    ctx.setLineDash([]); ctx.globalAlpha = 1;
+                }
+                ctx.strokeStyle = '#1a2744'; ctx.lineWidth = 1; ctx.strokeRect(padL, padT, cw, ch);
+            }
+            reset() { this.writeIdx = 0; this.count = 0; this.events = []; this.panOffset = 0; }
+        }
+
+        let chart = null;
+        function initChart() { if (!chart) chart = new RealtimeChart('chartCanvas', 'chartLegend'); }
+
+        // ==================== VIDEO RECORDING + DATA EXPORT ====================
+        let mediaRecorder = null;
+        let recordedChunks = [];
+        let recordedData = [];
+        let isRecording = false;
+        let recStartTime = 0;
+        let recTimerInterval = null;
+
+        function toggleRecording() {
+            if (isRecording) { stopRecording(); } else { startRecording(); }
+        }
+
+        function startRecording() {
+            const overlayCanvas = document.getElementById('overlay');
+            const stream = overlayCanvas.captureStream(30);
+            recordedChunks = [];
+            recordedData = [];
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9' });
+            mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
+            mediaRecorder.start(100);
+            isRecording = true;
+            recStartTime = Date.now();
+            document.getElementById('recBtn').classList.add('recording');
+            document.getElementById('recStopBtn').style.display = 'flex';
+            document.getElementById('recIndicator').classList.add('active');
+            document.getElementById('recDownload').classList.remove('visible');
+            recTimerInterval = setInterval(updateRecTimer, 100);
+        }
+
+        function stopRecording() {
+            if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+            mediaRecorder.stop();
+            isRecording = false;
+            clearInterval(recTimerInterval);
+            document.getElementById('recBtn').classList.remove('recording');
+            document.getElementById('recStopBtn').style.display = 'none';
+            document.getElementById('recIndicator').classList.remove('active');
+            document.getElementById('recDownload').classList.add('visible');
+        }
+
+        function updateRecTimer() {
+            const elapsed = Math.floor((Date.now() - recStartTime) / 1000);
+            const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+            const s = String(elapsed % 60).padStart(2, '0');
+            document.getElementById('recTimer').textContent = m + ':' + s;
+        }
+
+        function pushRecordingFrame(data) {
+            if (!isRecording) return;
+            recordedData.push({ t: Date.now() - recStartTime, ...data });
+        }
+
+        function downloadVideo() {
+            const blob = new Blob(recordedChunks, { type: 'video/webm' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = 'recording-' + new Date().toISOString().slice(0, 19).replace(/:/g, '') + '.webm';
+            a.click(); URL.revokeObjectURL(url);
+        }
+
+        function downloadCSV() {
+            if (!recordedData.length) return;
+            const headers = ['timestamp_ms', 'leftEOS', 'rightEOS', 'mar', 'gazeRatio', 'yaw', 'pitch', 'blinkDetected', 'microSign'];
+            const rows = recordedData.map(d => [d.t, d.leftEOS, d.rightEOS, d.mar, d.gazeRatio, d.yaw, d.pitch, d.blink ? 1 : 0, d.microSign || '']);
+            const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = 'data-' + new Date().toISOString().slice(0, 19).replace(/:/g, '') + '.csv';
+            a.click(); URL.revokeObjectURL(url);
         }
 
         window.startCamera = startCamera;
