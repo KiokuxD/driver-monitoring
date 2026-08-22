@@ -426,7 +426,7 @@ const CAL_CONFIG = {
     headPoseGateYaw: 30,
     headPoseGatePitch: 20,
     eosVelocityThreshold: 0.15,
-    maxEosChangePerFrame: 0.25
+    maxEosChangePerFrame: 0.18
 };
 
         const CALIBRATION = {
@@ -697,15 +697,19 @@ function startCalibration() {
                 this.frameCount++;
                 
                 // Velocity filter: detect sudden EOS jumps (head shake artifact)
+                let velocity = 0;
                 if (this.prevEOS !== null) {
-                    this.eosVelocity = Math.abs(EOS - this.prevEOS);
+                    velocity = Math.abs(EOS - this.prevEOS);
                 }
-                this.prevEOS = EOS;
                 
                 // Reject if EOS change too fast — likely head shake, not blink
-                if (this.eosVelocity > CAL_CONFIG.maxEosChangePerFrame && this.state !== 'CLOSED') {
+                if (velocity > CAL_CONFIG.maxEosChangePerFrame && this.state !== 'CLOSED') {
                     return { state: this.state, blink: false, blinkCount: this.blinkCount, duration: this.totalBlinkDuration };
                 }
+                
+                // Only update prevEOS AFTER passing the filter
+                this.prevEOS = EOS;
+                this.eosVelocity = velocity;
                 
                 switch (this.state) {
                     case 'OPEN':
@@ -832,8 +836,8 @@ function computeRuntimeEOS(landmarks, eyeSide) {
                 // Head pose gate — reject blink detection when head is turned/shaking
                 const nose = lm[1], lEye = lm[33], rEye = lm[263], fore = lm[10], chin = lm[152];
                 const eyeCx = (lEye.x + rEye.x) / 2;
-                const eyeW = Math.abs(rEye.x - lEye.x);
-                const faceH = Math.abs(chin.y - fore.y);
+                const eyeW = dist(lEye, rEye);
+                const faceH = dist(fore, chin);
                 const quickYaw = eyeW > 0 ? ((nose.x - eyeCx) / eyeW) * 50 : 0;
                 const quickPitch = faceH > 0 ? ((nose.y - (fore.y + chin.y) / 2) / (faceH * 0.5)) * 50 : 0;
                 const headStable = Math.abs(quickYaw) < CAL_CONFIG.headPoseGateYaw && Math.abs(quickPitch) < CAL_CONFIG.headPoseGatePitch;
