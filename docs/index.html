@@ -420,9 +420,13 @@ const CAL_CONFIG = {
     minRange: 0.002,
     thresholdFactor: 0.3,
     openThresholdFactor: 0.4,
-    emaAlpha: 0.3,
-    minClosedFrames: 2,
-    minOpenFrames: 3
+    emaAlpha: 0.7,
+    minClosedFrames: 1,
+    minOpenFrames: 2,
+    headPoseGateYaw: 30,
+    headPoseGatePitch: 20,
+    eosVelocityThreshold: 0.15,
+    maxEosChangePerFrame: 0.25
 };
 
         const CALIBRATION = {
@@ -685,10 +689,24 @@ function startCalibration() {
                 this.totalBlinkDuration = 0;
                 this.blinkStartFrame = 0;
                 this.frameCount = 0;
+                this.prevEOS = null;
+                this.eosVelocity = 0;
             }
             update(EOS, thresholdClose, thresholdOpen) {
                 let blink = false;
                 this.frameCount++;
+                
+                // Velocity filter: detect sudden EOS jumps (head shake artifact)
+                if (this.prevEOS !== null) {
+                    this.eosVelocity = Math.abs(EOS - this.prevEOS);
+                }
+                this.prevEOS = EOS;
+                
+                // Reject if EOS change too fast — likely head shake, not blink
+                if (this.eosVelocity > CAL_CONFIG.maxEosChangePerFrame && this.state !== 'CLOSED') {
+                    return { state: this.state, blink: false, blinkCount: this.blinkCount, duration: this.totalBlinkDuration };
+                }
+                
                 switch (this.state) {
                     case 'OPEN':
                         if (EOS < thresholdClose) {
@@ -810,36 +828,46 @@ function computeRuntimeEOS(landmarks, eyeSide) {
 
             // === CALIBRATION-BASED BLINK DETECTION ===
             if (CALIBRATION.isComplete() && calibrationPhase !== 'CLOSED_CAL' && calibrationPhase !== 'OPEN_CAL') {
-                const leftEOS_raw = computeRuntimeEOS(lm, 'left');
-                const rightEOS_raw = computeRuntimeEOS(lm, 'right');
                 
-                leftEOS = leftEOS_raw !== null ? eosSmoother.left.update(leftEOS_raw) : null;
-                rightEOS = rightEOS_raw !== null ? eosSmoother.right.update(rightEOS_raw) : null;
+                // Head pose gate — reject blink detection when head is turned/shaking
+                const nose = lm[1], lEye = lm[33], rEye = lm[263], fore = lm[10], chin = lm[152];
+                const eyeCx = (lEye.x + rEye.x) / 2;
+                const eyeW = Math.abs(rEye.x - lEye.x);
+                const faceH = Math.abs(chin.y - fore.y);
+                const quickYaw = eyeW > 0 ? ((nose.x - eyeCx) / eyeW) * 50 : 0;
+                const quickPitch = faceH > 0 ? ((nose.y - (fore.y + chin.y) / 2) / (faceH * 0.5)) * 50 : 0;
+                const headStable = Math.abs(quickYaw) < CAL_CONFIG.headPoseGateYaw && Math.abs(quickPitch) < CAL_CONFIG.headPoseGatePitch;
                 
-                // Use NORMALIZED thresholds since computeRuntimeEOS returns [0,1]
-                if (leftEOS !== null) {
-                    const lr = blinkMachines.left.update(
-                        leftEOS,
-                        CAL_CONFIG.thresholdFactor,
-                        CAL_CONFIG.thresholdFactor * CAL_CONFIG.openThresholdFactor
-                    );
-                    leftBlink = lr.blink;
-                }
-                if (rightEOS !== null) {
-                    const rr = blinkMachines.right.update(
-                        rightEOS,
-                        CAL_CONFIG.thresholdFactor,
-                        CAL_CONFIG.thresholdFactor * CAL_CONFIG.openThresholdFactor
-                    );
-                    rightBlink = rr.blink;
-                }
-                
-                // Combined blink: both eyes OR either eye
-                const calBlinkDetected = leftBlink || rightBlink;
-                
-                if (calBlinkDetected) {
-                    blinkTimestamps.push(Date.now());
-                    if (blinkTimestamps.length > 60) blinkTimestamps.shift();
+                if (headStable) {
+                    const leftEOS_raw = computeRuntimeEOS(lm, 'left');
+                    const rightEOS_raw = computeRuntimeEOS(lm, 'right');
+                    
+                    leftEOS = leftEOS_raw !== null ? eosSmoother.left.update(leftEOS_raw) : null;
+                    rightEOS = rightEOS_raw !== null ? eosSmoother.right.update(rightEOS_raw) : null;
+                    
+                    if (leftEOS !== null) {
+                        const lr = blinkMachines.left.update(
+                            leftEOS,
+                            CAL_CONFIG.thresholdFactor,
+                            CAL_CONFIG.thresholdFactor * CAL_CONFIG.openThresholdFactor
+                        );
+                        leftBlink = lr.blink;
+                    }
+                    if (rightEOS !== null) {
+                        const rr = blinkMachines.right.update(
+                            rightEOS,
+                            CAL_CONFIG.thresholdFactor,
+                            CAL_CONFIG.thresholdFactor * CAL_CONFIG.openThresholdFactor
+                        );
+                        rightBlink = rr.blink;
+                    }
+                    
+                    const calBlinkDetected = leftBlink || rightBlink;
+                    
+                    if (calBlinkDetected) {
+                        blinkTimestamps.push(Date.now());
+                        if (blinkTimestamps.length > 60) blinkTimestamps.shift();
+                    }
                 }
 
                 // Update debug panel
