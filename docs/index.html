@@ -104,6 +104,7 @@
             </div>
             <p id="calResult" style="display:none; font-size:14px;"></p>
             <button id="calStartBtn" onclick="startCalibration()" style="background:#00d4ff; color:#000; border:none; padding:12px 30px; border-radius:8px; font-size:16px; font-weight:bold; cursor:pointer; margin-top:10px;">Start Calibration</button>
+            <button id="calNextBtn" onclick="nextCalibrationStep()" style="display:none; background:#00ff88; color:#000; border:none; padding:12px 30px; border-radius:8px; font-size:16px; font-weight:bold; cursor:pointer; margin-top:10px;">Next &#8594;</button>
             <button id="calCloseBtn" onclick="closeCalibrationOverlay()" style="display:none; background:#333; color:#fff; border:1px solid #555; padding:10px 25px; border-radius:8px; font-size:14px; cursor:pointer; margin-top:10px;">Close</button>
         </div>
     </div>
@@ -416,7 +417,7 @@
 const CAL_CONFIG = {
     closedHoldFrames: 60,
     openHoldFrames: 30,
-    minRange: 0.01,
+    minRange: 0.002,
     thresholdFactor: 0.3,
     openThresholdFactor: 0.4,
     emaAlpha: 0.3,
@@ -525,6 +526,22 @@ function collectCalibrationFrame(landmarks, eyeSide, state) {
 
         // ==================== CALIBRATION UI FLOW ====================
 
+function playBeep() {
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, ctx.currentTime);
+        gain.gain.setValueAtTime(0.3, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + 0.3);
+    } catch(e) {}
+}
+
 function startCalibration() {
     calibrationPhase = 'CLOSED_CAL';
     calibrationBuffers.left = { closed: [], open: [] };
@@ -535,10 +552,24 @@ function startCalibration() {
             document.getElementById('calTitle').textContent = 'Step 1/2: Close Your Eyes';
             document.getElementById('calInstruction').textContent = 'Close your eyes gently and hold for 3 seconds...';
             document.getElementById('calStartBtn').style.display = 'none';
+            document.getElementById('calNextBtn').style.display = 'none';
             document.getElementById('calResult').style.display = 'none';
             document.getElementById('calCloseBtn').style.display = 'none';
             document.getElementById('calLeftStatus').textContent = '...';
             document.getElementById('calRightStatus').textContent = '...';
+        }
+
+        function nextCalibrationStep() {
+            calibrationPhase = 'OPEN_CAL';
+            calibrationBuffers.left.open = [];
+            calibrationBuffers.right.open = [];
+            document.getElementById('calTitle').textContent = 'Step 2/2: Open Your Eyes';
+            document.getElementById('calInstruction').textContent = 'Open your eyes normally and look at the camera for 2 seconds...';
+            document.getElementById('calProgressBar').style.width = '0%';
+            document.getElementById('calStatus').textContent = '0 / 30 frames';
+            document.getElementById('calLeftStatus').textContent = '...';
+            document.getElementById('calRightStatus').textContent = '...';
+            document.getElementById('calNextBtn').style.display = 'none';
         }
 
         function updateCalibrationUI(progressLeft, progressRight) {
@@ -554,13 +585,13 @@ function startCalibration() {
 
         function transitionCalibrationPhase() {
             if (calibrationPhase === 'CLOSED_CAL') {
-                calibrationPhase = 'OPEN_CAL';
-                document.getElementById('calTitle').textContent = 'Step 2/2: Open Your Eyes';
-                document.getElementById('calInstruction').textContent = 'Open your eyes normally and look at the camera for 2 seconds...';
-                document.getElementById('calProgressBar').style.width = '0%';
-                document.getElementById('calStatus').textContent = '0 / 30 frames';
-                document.getElementById('calLeftStatus').textContent = '...';
-                document.getElementById('calRightStatus').textContent = '...';
+                calibrationPhase = 'WAITING_NEXT';
+                document.getElementById('calTitle').textContent = 'Step 1 Complete!';
+                document.getElementById('calInstruction').textContent = 'Open your eyes, then press Next to continue.';
+                document.getElementById('calProgressBar').style.width = '100%';
+                document.getElementById('calStatus').textContent = '';
+                document.getElementById('calNextBtn').style.display = 'inline-block';
+                playBeep();
             }
         }
 
@@ -597,6 +628,7 @@ function startCalibration() {
             document.getElementById('calResult').style.color = (leftOk && rightOk) ? '#00ff88' : '#ffd93d';
             document.getElementById('calStatus').textContent = '';
             document.getElementById('calCloseBtn').style.display = 'inline-block';
+            playBeep();
         }
 
         function closeCalibrationOverlay() {
@@ -609,6 +641,7 @@ function startCalibration() {
         return;
     }
             document.getElementById('calibrationOverlay').style.display = 'flex';
+            document.getElementById('calNextBtn').style.display = 'none';
             if (CALIBRATION.isComplete()) {
                 document.getElementById('calTitle').textContent = 'Recalibrate?';
                 document.getElementById('calInstruction').textContent = 'Eyes are already calibrated. Recalibrate?';
@@ -1169,6 +1202,7 @@ function computeRuntimeEOS(landmarks, eyeSide) {
         window.resetAlerts = resetAlerts;
         window.showCalibrationOverlay = showCalibrationOverlay;
         window.startCalibration = startCalibration;
+        window.nextCalibrationStep = nextCalibrationStep;
         window.closeCalibrationOverlay = closeCalibrationOverlay;
 
         loadModel();
